@@ -1,0 +1,14 @@
+[Unit]
+Description=Spider-Man live assistant (overlay character, reminders, alarms, battery)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=GDK_BACKEND=x11
+ExecStart=%h/.local/bin/spiderman-overlay
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

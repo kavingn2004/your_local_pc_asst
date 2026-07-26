@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""Spider-Man live desktop overlay.
+- small draggable character (move it anywhere with the mouse)
+- left-click  -> a random action (quip / time / battery / next task / greet)
+- right-click -> menu (add reminder, list, mute, quit)
+- reminders / alarms / battery alerts -> speech bubble (typewriter) + voice
+Runs over Wayland via XWayland."""
+import os
+os.environ.setdefault("GDK_BACKEND", "x11")
+
+import json, time, random, subprocess
+from pathlib import Path
+from datetime import datetime, timedelta
+
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, Gdk, GdkPixbuf, GLib
+
+APP   = "Local_Asst"   # product name; the character is the persona
+CONF  = Path.home() / ".config" / "spiderman"
+TASKS = CONF / "tasks.json"
+STATE = CONF / "state.json"
+HERO  = CONF / "spiderman-hero.png"
+ICON  = CONF / "spiderman.png"
+
+SPRITE_H   = 120       # smaller character
+VOICE_RATE = "-18"     # slower speech
+TYPE_MS    = 38        # typewriter speed (ms per char)
+
+def _read(p, d):
+    try: return json.loads(p.read_text())
+    except Exception: return d
+def load_tasks():  return _read(TASKS, [])
+def save_tasks(t): TASKS.write_text(json.dumps(t, indent=2))
+def load_state():  return _read(STATE, {"muted": False})
+def save_state(s):
+    try: STATE.write_text(json.dumps(s, indent=2))
+    except Exception: pass
+
+def speak(text):
+    if load_state().get("muted"): return
+    try:
+        c = char_cfg()
+        subprocess.Popen(["spd-say", "-o", "espeak-ng", "-t", "male3",
+                          "-p", c["pitch"], "-r", c["rate"], "-i", "100", text])
+    except Exception:
+        pass
+
+def notify(title, body, urgency="normal"):
+    """Notifications are branded with the chosen character, not a fixed name."""
+    try:
+        # branded as the product; the character's artwork shows who is speaking
+        subprocess.Popen(["notify-send", "-a", APP, "-i", str(sprite_path()),
+                          "-u", urgency, title or APP, body])
+    except Exception:
+        pass
+
+# ---------- Google Tasks bridge (runs in the project venv) ----------
+PROJ    = Path(__file__).resolve().parent.parent
+VENV_PY = PROJ / ".venv" / "bin" / "python"
+GSYNC   = PROJ / "lib" / "google_sync.py"
+ISYNC   = PROJ / "lib" / "ical_sync.py"
+GTOKEN  = Path.home() / ".config" / "spiderman" / "google" / "token.json"
+CALCONF = Path.home() / ".config" / "spiderman" / "calendar.json"
+
+def google_ready():
+    return VENV_PY.exists() and GSYNC.exists() and GTOKEN.exists()
+
+def calendar_ready():
+    # EDS calendars come from GNOME Online Accounts; no config file required
+    return (VENV_PY.exists() and ISYNC.exists()
+            and (Path.home() / ".cache/evolution/calendar").exists())
+
+def _spawn(mod, *args):
+    try:
+        subprocess.Popen([str(VENV_PY), str(mod), *args],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def google_call(*args):
+    """Fire-and-forget call into google_sync.py; never blocks the UI."""
+    if google_ready():
+        _spawn(GSYNC, *args)
+
+def calendar_call(*args):
+    """Fire-and-forget call into ical_sync.py."""
+    if calendar_ready():
+        _spawn(ISYNC, *args)
+
+CHARS_DIR = CONF / "characters"
+
+# Each character gets its own voice settings and lines. pitch/rate are passed
+# straight to spd-say, so the voice changes with the sprite.
+CHARACTERS = {
+    "spider-man": dict(
+        name="Spider-Man", pitch="35", rate="-18",
+        leads=["Thwip!", "Spider-sense tingling!", "Hey there, web-head!",
+               "Your friendly neighborhood Spider-Man here!"],
+        quips=["With great power comes great responsibility!",
+               "Doing whatever a spider can!",
+               "Web-shooters loaded and ready!",
+               "Just hanging around... upside down, usually."]),
+    "iron-man": dict(
+        name="Iron Man", pitch="10", rate="-8",
+        leads=["Heads up.", "Sir.", "Reminder from your favourite genius.",
+               "Let's get to work."],
+        quips=["I am Iron Man.",
+               "Genius, billionaire, playboy, philanthropist.",
+               "Sometimes you gotta run before you can walk.",
+               "Arc reactor at full capacity."]),
+    "thor": dict(
+        name="Thor", pitch="-25", rate="-22",
+        leads=["Hear me!", "By Odin's beard!", "Mortal!", "Attend!"],
+        quips=["I am Thor, son of Odin!",
+               "Bring me another desktop!",
+               "This drink, I like it. Another!",
+               "I have been fighting for many years."]),
+    "hulk": dict(
+        name="Hulk", pitch="-45", rate="-30",
+        leads=["HULK SAY!", "LISTEN!", "HULK REMIND!"],
+        quips=["HULK SMASH!", "HULK STRONGEST ONE THERE IS!",
+               "PUNY DESKTOP.", "HULK LIKE REMINDERS."]),
+    "captain-america": dict(
+        name="Captain America", pitch="-10", rate="-16",
+        leads=["Heads up, soldier.", "On your left.", "Listen up."],
+        quips=["I could do this all day.",
+               "The price of freedom is high.",
+               "I'm just a kid from Brooklyn.",
+               "Language!"]),
+    "black-panther": dict(
+        name="Black Panther", pitch="-20", rate="-18",
+        leads=["Hear me.", "Attention.", "A message for you."],
+        quips=["Wakanda forever!",
+               "In my culture, death is not the end.",
+               "The wise build bridges.",
+               "I never freeze."]),
+    "black-widow": dict(
+        name="Black Widow", pitch="55", rate="-12",
+        leads=["Hey.", "Quick word.", "Listen."],
+        quips=["I'm always picking up after you boys.",
+               "I have a very particular set of skills.",
+               "Love is for children.",
+               "This is my job."]),
+    "groot": dict(
+        name="Groot", pitch="-35", rate="-25",
+        leads=["I am Groot.", "I am Groot!", "I am Groot?"],
+        quips=["I am Groot.", "I am Groot!", "I AM GROOT!",
+               "We are Groot."]),
+    "wanda": dict(
+        name="Wanda", pitch="45", rate="-16",
+        leads=["A vision.", "I sense something.", "Listen closely."],
+        quips=["You took everything from me.",
+               "I can't control their fear, only my own.",
+               "Chaos is not a pit, it is a ladder.",
+               "The Scarlet Witch is not born, she is forged."]),
+}
+DEFAULT_CHAR = "spider-man"
+
+
+def current_char():
+    key = load_state().get("character", DEFAULT_CHAR)
+    return key if key in CHARACTERS else DEFAULT_CHAR
+
+
+def char_cfg():
+    return CHARACTERS[current_char()]
+
+
+def sprite_path(key=None):
+    """The chosen character's PNG, falling back to the original hero image."""
+    key = key or current_char()
+    p = CHARS_DIR / f"{key}.png"
+    return p if p.exists() else HERO
+
+
+def voice_line(kind, text):
+    c = char_cfg()
+    lead = random.choice(c["leads"])
+    if c["name"] == "Groot":          # Groot only ever says one thing
+        return f"{lead} {lead}"
+    if kind == "reminder": return f"{lead} Reminder: {text}"
+    if kind == "alarm":    return f"{lead} Alarm time! {text}"
+    return f"{lead} {text}"
+
+def clock_str(epoch=None):
+    dt = datetime.fromtimestamp(epoch) if epoch else datetime.now()
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+CSS = b"""
+window { background-color: rgba(0,0,0,0); }
+.bubble {
+  background-color: rgba(255,255,255,0.97);
+  color: #14181f;
+  border-radius: 16px;
+  padding: 10px 14px;
+  border: 3px solid #ce2027;
+  font-size: 14px;
+  font-weight: 700;
+}
+"""
+
+class Overlay(Gtk.Window):
+    def __init__(self):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_keep_above(True)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_accept_focus(False)
+        self.set_type_hint(Gdk.WindowTypeHint.UTILITY)
+        self.stick()
+
+        screen = self.get_screen()
+        vis = screen.get_rgba_visual()
+        if vis: self.set_visual(vis)
+        prov = Gtk.CssProvider(); prov.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        # event box captures mouse for drag + click
+        self.evbox = Gtk.EventBox()
+        self.evbox.set_visible_window(False)
+        self.evbox.add_events(Gdk.EventMask.BUTTON_PRESS_MASK |
+                              Gdk.EventMask.BUTTON_RELEASE_MASK |
+                              Gdk.EventMask.POINTER_MOTION_MASK)
+        self.add(self.evbox)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_valign(Gtk.Align.END)
+        self.evbox.add(box)
+
+        self.bubble = Gtk.Label()
+        self.bubble.set_line_wrap(True)
+        self.bubble.set_max_width_chars(26)
+        self.bubble.set_justify(Gtk.Justification.CENTER)
+        self.bubble.get_style_context().add_class("bubble")
+        self.bubble.set_halign(Gtk.Align.CENTER)
+        box.pack_start(self.bubble, False, False, 0)
+
+        self._char = current_char()
+        self.sprite = Gtk.Image()
+        w = self._load_sprite()
+        box.pack_start(self.sprite, False, False, 0)
+        self.win_w, self.win_h = max(w, 300), SPRITE_H + 120
+
+        disp = Gdk.Display.get_default()
+        mon = disp.get_primary_monitor() or disp.get_monitor(0)
+        geo = mon.get_geometry()
+        self.geo = geo
+
+        st = load_state()
+        self.x = st.get("x", geo.x + geo.width - self.win_w - 30)
+        self.y = st.get("y", geo.y + geo.height - self.win_h - 60)
+
+        self._drag = None
+        self._moved = False
+        self._type_id = None
+        self._hide_id = None
+        self._full = ""
+        self._warned = {"low": False, "crit": False, "full": False}
+
+        self.evbox.connect("button-press-event", self._press)
+        self.evbox.connect("motion-notify-event", self._motion)
+        self.evbox.connect("button-release-event", self._release)
+        self.connect("realize", lambda *_: self.move(int(self.x), int(self.y)))
+        self.connect("delete-event", lambda *a: (print("DELETE-EVENT", flush=True), True)[-1])
+        self.connect("destroy", lambda *a: (print("DESTROY fired", flush=True), Gtk.main_quit())[-1])
+
+        GLib.timeout_add_seconds(15, self._tick)
+        GLib.timeout_add_seconds(3, self._check_character)
+        if google_ready() or calendar_ready():
+            GLib.timeout_add_seconds(120, self._remote_sync)
+            GLib.timeout_add_seconds(5, lambda: (self._remote_sync(), False)[-1])
+
+    def _load_sprite(self):
+        """Point the image at the current character; returns its width."""
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file(str(sprite_path(self._char)))
+        except Exception:
+            pb = GdkPixbuf.Pixbuf.new_from_file(str(HERO))
+        w = max(1, int(pb.get_width() * SPRITE_H / pb.get_height()))
+        pb = pb.scale_simple(w, SPRITE_H, GdkPixbuf.InterpType.HYPER)
+        self.sprite.set_from_pixbuf(pb)
+        return w
+
+    def _check_character(self):
+        """Swap the sprite if the character was changed elsewhere."""
+        key = current_char()
+        if key != self._char:
+            self._char = key
+            self._load_sprite()
+            self.say(f"{char_cfg()['name']} reporting for duty!",
+                     random.choice(char_cfg()["leads"]))
+        return True
+
+    def _remote_sync(self):
+        """Pull Google Tasks + calendar events. Fire-and-forget, never blocks."""
+        google_call("sync")
+        calendar_call("sync")
+        return True
+
+    # ---------- drag + click ----------
+    def _press(self, w, e):
+        if e.button == 3:
+            self._menu(e); return True
+        if e.button == 1:
+            self._drag = (e.x_root, e.y_root, self.x, self.y)
+            self._moved = False
+        return True
+
+    def _motion(self, w, e):
+        if self._drag:
+            dx = e.x_root - self._drag[0]; dy = e.y_root - self._drag[1]
+            if abs(dx) > 3 or abs(dy) > 3: self._moved = True
+            self.x = self._drag[2] + dx; self.y = self._drag[3] + dy
+            self.move(int(self.x), int(self.y))
+        return True
+
+    def _release(self, w, e):
+        if e.button == 1 and self._drag:
+            self._drag = None
+            if self._moved:
+                s = load_state(); s["x"] = int(self.x); s["y"] = int(self.y); save_state(s)
+            else:
+                self._on_click()
+        return True
+
+    def _on_click(self):
+        random.choice([self._act_quip, self._act_time, self._act_battery,
+                       self._act_next, self._act_greet])()
+
+    # ---------- click actions ----------
+    def _act_quip(self):
+        q = random.choice(char_cfg()["quips"]); self.say(q, q)
+    def _act_greet(self):
+        self.say("Hey! Great to see you. 🕸️", "Hey! Great to see you!")
+    def _act_time(self):
+        t = clock_str(); self.say(f"🕒 It's {t}", f"It's {t}")
+    def _act_battery(self):
+        try:
+            cap = int(Path("/sys/class/power_supply/BAT0/capacity").read_text().strip())
+            st  = Path("/sys/class/power_supply/BAT0/status").read_text().strip()
+            self.say(f"🔋 Battery {cap}% ({st})", f"Battery is at {cap} percent, {st}.")
+        except Exception:
+            self.say("🔋 Can't read the battery right now.", "I can't read the battery right now.")
+    def _act_next(self):
+        tasks = sorted([t for t in load_tasks() if not t.get("fired")], key=lambda t: t["due"])
+        if tasks:
+            t = tasks[0]; when = clock_str(t["due"])
+            self.say(f"🔔 Next: {t['text']} at {when}", f"Next up: {t['text']}, at {when}")
+        else:
+            self.say("✅ All clear — no tasks!", "All clear! No tasks on the web right now.")
+
+    # ---------- right-click menu ----------
+    def _menu(self, e):
+        m = Gtk.Menu()
+        def item(label, cb):
+            it = Gtk.MenuItem(label=label); it.connect("activate", cb); m.append(it)
+        item("➕  Add reminder…", lambda *_: subprocess.Popen(["spiderman", "gui"]))
+        item("📋  Next task",     lambda *_: self._act_next())
+        muted = load_state().get("muted")
+        item("🔊  Unmute" if muted else "🔇  Mute",
+             lambda *_: self._toggle_mute())
+        item("❌  Quit",          lambda *_: Gtk.main_quit())
+        m.show_all(); m.popup_at_pointer(e)
+
+    def _toggle_mute(self):
+        s = load_state(); s["muted"] = not s.get("muted"); save_state(s)
+        if not s["muted"]:
+            self.say("🔊 Back online!", "I'm back online!")
+
+    # ---------- speech bubble (typewriter) ----------
+    def say(self, text, voice=None, urgency="normal"):
+        if load_state().get("muted"): return
+        notify(APP, text, urgency)
+        speak(voice or text)
+        self._full = text
+        self.bubble.set_text("")
+        self.bubble.show()
+        if self._type_id: GLib.source_remove(self._type_id)
+        self._i = 0
+        self._type_id = GLib.timeout_add(TYPE_MS, self._type_step)
+        if self._hide_id: GLib.source_remove(self._hide_id)
+        dur = min(14, max(6, len(text) // 6 + 4))
+        self._hide_id = GLib.timeout_add_seconds(dur, self._hide_bubble)
+
+    def _type_step(self):
+        self._i += 1
+        self.bubble.set_text(self._full[:self._i])
+        if self._i >= len(self._full):
+            self._type_id = None; return False
+        return True
+
+    def _hide_bubble(self):
+        self.bubble.set_text(""); self.bubble.hide()
+        self._hide_id = None; return False
+
+    # ---------- alerts loop ----------
+    def _tick(self):
+        now = time.time()
+        tasks = load_tasks(); changed = False
+        for t in tasks:
+            if not t.get("fired") and t.get("due", 0) <= now:
+                kind = t.get("type", "reminder")
+                when = clock_str(t["due"])
+                mark = {"alarm": "⏰", "event": "📅"}.get(kind, "🔔")
+                self.say(f"{mark} {t['text']}  ·  {when}",
+                         voice_line(kind, t["text"]),
+                         urgency="critical" if kind == "alarm" else "normal")
+                # A task pulled from Google must be completed remotely, or the
+                # next pull would re-add it and announce it forever.
+                if t.get("gid") and t.get("glist"):
+                    google_call("complete", t["glist"], t["gid"])
+                # Calendar is read-only, so instead record the event id locally
+                # to stop the next pull re-adding it.
+                elif str(t.get("gid", "")).startswith("cal:"):
+                    calendar_call("seen", t["gid"][4:], str(t.get("estart", "")))
+                t["fired"] = True; changed = True
+        if changed:
+            # Re-read before writing. The CLI and the app edit this same file,
+            # so writing back our own (possibly stale) list would resurrect
+            # anything cancelled while this tick was running. Instead, drop
+            # only the ids we actually fired.
+            fired = {t["id"] for t in tasks if t.get("fired") and "id" in t}
+            current = load_tasks()
+            save_tasks([t for t in current if t.get("id") not in fired])
+        try:
+            cap = int(Path("/sys/class/power_supply/BAT0/capacity").read_text().strip())
+            stt = Path("/sys/class/power_supply/BAT0/status").read_text().strip()
+        except Exception:
+            cap = None
+        if cap is not None:
+            charging = stt in ("Charging", "Full")
+            if charging:
+                self._warned["low"] = self._warned["crit"] = False
+                if cap >= 85 and not self._warned["full"]:
+                    self.say(f"🔌 Battery {cap}% — unplug to keep it healthy!",
+                             f"Hey web-head, battery's at {cap} percent. Unplug me to protect the battery!")
+                    self._warned["full"] = True
+            else:
+                self._warned["full"] = False
+                if cap <= 10 and not self._warned["crit"]:
+                    self.say(f"⚠️ CRITICAL {cap}% — plug in now!",
+                             f"Danger! Battery critical at {cap} percent. Plug in now!", "critical")
+                    self._warned["crit"] = True
+                elif cap <= 20 and not self._warned["low"]:
+                    self.say(f"🔋 Battery low {cap}% — find a charger!",
+                             f"Spider-sense tingling! Battery low at {cap} percent. Find a charger!")
+                    self._warned["low"] = True
+        return True
+
+
+def main():
+    win = Overlay()
+    win.show_all()
+    win.bubble.hide()
+    GLib.timeout_add_seconds(2, lambda: (win.say("Spider-Man online! Drag me around, click me for tricks. 🕸️",
+                                                 "Your friendly neighborhood Spider-Man is online! Drag me around, or click me for tricks."), False)[-1])
+    Gtk.main()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spider-Man API — Swagger UI</title>
+<link rel="stylesheet" href="/vendor/swagger-ui.css">
+<style>
+  body { margin:0; background:#0f1216; }
+  .topbar { display:none; }                 /* hide the URL bar — spec is local */
+  .banner { background:#ce2027; color:#fff; padding:12px 20px;
+            font:600 14px/1.4 system-ui,sans-serif; display:flex;
+            align-items:center; gap:12px; flex-wrap:wrap; }
+  .banner a { color:#fff; }
+  .banner .tag { background:rgba(0,0,0,.25); padding:3px 9px;
+                 border-radius:99px; font-size:12px; font-weight:700; }
+  #swagger-ui { background:#fff; }
+</style>
+</head>
+<body>
+  <div class="banner">
+    <span>🕷️ Spider-Man Assistant API</span>
+    <span class="tag">local only · 127.0.0.1</span>
+    <span style="opacity:.85;font-weight:400">
+      “Try it out” executes for real — it will change your assistant.
+    </span>
+    <a href="/" style="margin-left:auto">← control panel</a>
+  </div>
+  <div id="swagger-ui"></div>
+  <script src="/vendor/swagger-ui-bundle.js"></script>
+  <script src="/vendor/swagger-ui-standalone-preset.js"></script>
+  <script>
+    window.ui = SwaggerUIBundle({
+      url: "/openapi.json",
+      dom_id: "#swagger-ui",
+      deepLinking: true,
+      presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+      layout: "BaseLayout",
+      tryItOutEnabled: true,
+      displayRequestDuration: true,
+      defaultModelsExpandDepth: 1,
+      docExpansion: "list"
+    });
+  </script>
+</body>
+</html>

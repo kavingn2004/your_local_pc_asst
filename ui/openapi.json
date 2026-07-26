@@ -1,0 +1,1036 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Spider-Man Assistant API",
+    "version": "1.2.0",
+    "description": "Local control API for the Spider-Man desktop assistant, split by service.\n\n**Bound to 127.0.0.1 only.** It controls the assistant and exposes your task list, so it is deliberately not reachable from the network and has no authentication — the loopback binding *is* the boundary.\n\n⚠️ **“Try it out” executes for real.** There is no sandbox: `POST /api/assistant/stop` really stops the character, `POST /api/tasks` really creates a reminder."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8777",
+      "description": "local control panel"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Assistant",
+      "description": "The character itself — run state, mute, autostart"
+    },
+    {
+      "name": "Tasks",
+      "description": "Reminders, alarms and calendar events queued locally"
+    },
+    {
+      "name": "Google Tasks",
+      "description": "Two-way sync with Google Tasks (OAuth)"
+    },
+    {
+      "name": "Google Calendar",
+      "description": "Read-only events via GNOME Online Accounts → Evolution"
+    },
+    {
+      "name": "Slack",
+      "description": "Message announcements — currently unavailable"
+    },
+    {
+      "name": "Aggregate",
+      "description": "Everything at once (used by the control panel UI)"
+    }
+  ],
+  "paths": {
+    "/api/assistant": {
+      "get": {
+        "tags": [
+          "Assistant"
+        ],
+        "summary": "Assistant state",
+        "responses": {
+          "200": {
+            "description": "state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Assistant"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Assistant"
+        ],
+        "summary": "Mute or set autostart",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "muted": {
+                    "type": "boolean",
+                    "description": "silence all speech + bubbles"
+                  },
+                  "autostart": {
+                    "type": "boolean",
+                    "description": "launch at login"
+                  }
+                }
+              },
+              "examples": {
+                "mute": {
+                  "summary": "Mute alerts",
+                  "value": {
+                    "muted": true
+                  }
+                },
+                "unmute": {
+                  "summary": "Unmute",
+                  "value": {
+                    "muted": false
+                  }
+                },
+                "autostart": {
+                  "summary": "Disable autostart",
+                  "value": {
+                    "autostart": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated"
+          },
+          "400": {
+            "description": "nothing to change"
+          }
+        }
+      }
+    },
+    "/api/assistant/start": {
+      "post": {
+        "tags": [
+          "Assistant"
+        ],
+        "summary": "Start the character",
+        "responses": {
+          "200": {
+            "description": "started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/assistant/stop": {
+      "post": {
+        "tags": [
+          "Assistant"
+        ],
+        "summary": "Stop the character",
+        "description": "Stops the overlay. It returns at next login, or via /api/assistant/start.",
+        "responses": {
+          "200": {
+            "description": "stopped",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/battery": {
+      "get": {
+        "tags": [
+          "Assistant"
+        ],
+        "summary": "Battery level and health",
+        "responses": {
+          "200": {
+            "description": "battery",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Battery"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "no battery present"
+          }
+        }
+      }
+    },
+    "/api/tasks": {
+      "get": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "List queued reminders, alarms and events",
+        "responses": {
+          "200": {
+            "description": "tasks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tasks": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Task"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Create a reminder or alarm",
+        "description": "`when` accepts `30m`, `1h30m`, `90s`, `14:30`, `9am`. Set `google: true` to also create it in Google Tasks so it appears on your phone.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTask"
+              },
+              "examples": {
+                "reminder": {
+                  "summary": "In 30 minutes",
+                  "value": {
+                    "text": "call mom",
+                    "when": "30m"
+                  }
+                },
+                "atTime": {
+                  "summary": "At a clock time",
+                  "value": {
+                    "text": "standup",
+                    "when": "9:00"
+                  }
+                },
+                "alarm": {
+                  "summary": "An alarm",
+                  "value": {
+                    "kind": "alarm",
+                    "text": "meeting",
+                    "when": "14:30"
+                  }
+                },
+                "toGoogle": {
+                  "summary": "Also push to Google Tasks",
+                  "value": {
+                    "text": "review PR",
+                    "when": "1h",
+                    "google": true
+                  }
+                },
+                "localEvent": {
+                  "summary": "Local event entry",
+                  "value": {
+                    "kind": "event",
+                    "text": "lunch",
+                    "when": "13:00"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/when missing or unparseable"
+          }
+        }
+      }
+    },
+    "/api/tasks/{id}": {
+      "delete": {
+        "tags": [
+          "Tasks"
+        ],
+        "summary": "Cancel a task",
+        "description": "Removes it locally. Note: a task synced from Google is **not** deleted in Google — it will sync back. Complete it on your phone instead.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            },
+            "example": 1
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "cancelled"
+          },
+          "404": {
+            "description": "no such task"
+          }
+        }
+      }
+    },
+    "/api/google": {
+      "get": {
+        "tags": [
+          "Google Tasks"
+        ],
+        "summary": "Connection status",
+        "description": "`state` is one of `connected`, `logged_out`, `unconfigured`, `error`.",
+        "responses": {
+          "200": {
+            "description": "status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GoogleStatus"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Google Tasks"
+        ],
+        "summary": "Toggle auto-push",
+        "description": "When on, every reminder you create is also sent to Google Tasks.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "auto_push"
+                ],
+                "properties": {
+                  "auto_push": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "examples": {
+                "on": {
+                  "value": {
+                    "auto_push": true
+                  }
+                },
+                "off": {
+                  "value": {
+                    "auto_push": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated"
+          },
+          "400": {
+            "description": "auto_push required"
+          }
+        }
+      }
+    },
+    "/api/google/login": {
+      "post": {
+        "tags": [
+          "Google Tasks"
+        ],
+        "summary": "Start OAuth consent",
+        "description": "Opens your browser for Google's consent screen. Asynchronous — approve it there, then poll `GET /api/google`.",
+        "responses": {
+          "202": {
+            "description": "browser opened"
+          },
+          "409": {
+            "description": "credentials.json missing — Cloud setup not done"
+          },
+          "500": {
+            "description": "couldn't launch the flow"
+          }
+        }
+      }
+    },
+    "/api/google/logout": {
+      "post": {
+        "tags": [
+          "Google Tasks"
+        ],
+        "summary": "Disconnect",
+        "description": "Deletes the local token. Revoke the app entirely at myaccount.google.com/permissions.",
+        "responses": {
+          "200": {
+            "description": "logged out"
+          }
+        }
+      }
+    },
+    "/api/google/sync": {
+      "post": {
+        "tags": [
+          "Google Tasks"
+        ],
+        "summary": "Sync now (push + pull)",
+        "description": "Pushes pending local tasks, then pulls dated tasks from Google.",
+        "responses": {
+          "200": {
+            "description": "synced",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandResult"
+                },
+                "example": {
+                  "ok": true,
+                  "out": "🔄 synced — 2 dated task(s) in Google | ↑1 pushed, +1 new, ~0 updated, -0 removed"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Google unreachable or not logged in"
+          }
+        }
+      }
+    },
+    "/api/google/tasks": {
+      "get": {
+        "tags": [
+          "Google Tasks"
+        ],
+        "summary": "Dated tasks in Google",
+        "description": "What Google currently holds — useful to compare against `/api/tasks`.",
+        "responses": {
+          "200": {
+            "description": "remote tasks"
+          },
+          "502": {
+            "description": "not logged in / unreachable"
+          }
+        }
+      }
+    },
+    "/api/calendar": {
+      "get": {
+        "tags": [
+          "Google Calendar"
+        ],
+        "summary": "Detected calendars",
+        "description": "Calendars GNOME syncs into Evolution. Read-only — this API never modifies your calendar.",
+        "responses": {
+          "200": {
+            "description": "calendars",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CalendarStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/calendar/events": {
+      "get": {
+        "tags": [
+          "Google Calendar"
+        ],
+        "summary": "Upcoming events (24h)",
+        "description": "Timed events only; all-day entries (holidays, birthdays) are skipped. Recurring events are expanded.",
+        "responses": {
+          "200": {
+            "description": "events"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Google Calendar"
+        ],
+        "summary": "Create a calendar event",
+        "description": "Creates a **real event** in your writable calendar, which Evolution syncs up to Google — it will appear on your phone.\n\nNot via the Google Calendar API (that scope is blocked for unverified apps); it goes through the writable CalDAV connection GNOME already holds, the same route the GNOME Calendar app uses.\n\n`start` accepts ISO (`2026-07-20T14:30`), a clock time (`14:30`, next occurrence), or a relative offset (`+45m`, `+2h`).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewEvent"
+              },
+              "examples": {
+                "relative": {
+                  "summary": "In 45 minutes",
+                  "value": {
+                    "summary": "Coffee with Priya",
+                    "start": "+45m",
+                    "minutes": 30
+                  }
+                },
+                "clock": {
+                  "summary": "At 14:30 today/tomorrow",
+                  "value": {
+                    "summary": "Design review",
+                    "start": "14:30",
+                    "minutes": 60
+                  }
+                },
+                "iso": {
+                  "summary": "Exact date and time",
+                  "value": {
+                    "summary": "Sprint planning",
+                    "start": "2026-07-20T10:00",
+                    "minutes": 45
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "created in the calendar",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandResult"
+                },
+                "example": {
+                  "ok": true,
+                  "out": "📅 created 'Coffee with Priya' at 18 Jul 19:08"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "summary/start missing or unparseable"
+          },
+          "502": {
+            "description": "no writable calendar, or Evolution refused it"
+          }
+        }
+      }
+    },
+    "/api/calendar/sync": {
+      "post": {
+        "tags": [
+          "Google Calendar"
+        ],
+        "summary": "Queue upcoming events",
+        "description": "Merges events into the task list so the character announces them 10 minutes before.",
+        "responses": {
+          "200": {
+            "description": "synced"
+          },
+          "502": {
+            "description": "read failed"
+          }
+        }
+      }
+    },
+    "/api/calendar/refresh": {
+      "post": {
+        "tags": [
+          "Google Calendar"
+        ],
+        "summary": "Force Evolution to re-poll Google",
+        "description": "Also re-asserts the 5-minute refresh interval, which GNOME can reset.",
+        "responses": {
+          "200": {
+            "description": "refresh requested"
+          },
+          "502": {
+            "description": "failed"
+          }
+        }
+      }
+    },
+    "/api/calendar/calendars/{id}": {
+      "patch": {
+        "tags": [
+          "Google Calendar"
+        ],
+        "summary": "Include or exclude a calendar",
+        "description": "Use the `id` from `GET /api/calendar` — e.g. exclude the holidays calendar.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "e83aa74a"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "included"
+                ],
+                "properties": {
+                  "included": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "examples": {
+                "exclude": {
+                  "value": {
+                    "included": false
+                  }
+                },
+                "include": {
+                  "value": {
+                    "included": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "updated"
+          },
+          "400": {
+            "description": "included required"
+          }
+        }
+      }
+    },
+    "/api/slack": {
+      "get": {
+        "tags": [
+          "Slack"
+        ],
+        "summary": "Slack availability",
+        "description": "Reports why Slack announcements aren't working. Slack ships as a **snap**, and its desktop notifications never reach the D-Bus session bus — verified by capture, where only non-Slack notifications appeared. So there is nothing to intercept.\n\nTo make it work: install the **.deb** build of Slack (restores normal D-Bus notifications), or build a Slack app with Socket Mode (**needs workspace admin approval**).",
+        "responses": {
+          "200": {
+            "description": "status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SlackStatus"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/slack/connect": {
+      "post": {
+        "tags": [
+          "Slack"
+        ],
+        "summary": "Connect Slack (not implemented)",
+        "description": "Reserved. Returns **501** with the reason — see `GET /api/slack`.",
+        "responses": {
+          "501": {
+            "description": "not implemented — see detail"
+          }
+        }
+      }
+    },
+    "/api/slack/messages": {
+      "get": {
+        "tags": [
+          "Slack"
+        ],
+        "summary": "Recent messages (not implemented)",
+        "description": "Reserved for when a working Slack source exists.",
+        "responses": {
+          "501": {
+            "description": "not implemented — see detail"
+          }
+        }
+      }
+    },
+    "/api/status": {
+      "get": {
+        "tags": [
+          "Aggregate"
+        ],
+        "summary": "Everything at once",
+        "description": "One call returning assistant, battery, tasks, Google, calendar and Slack. Used by the control-panel UI (polled every 10s).",
+        "responses": {
+          "200": {
+            "description": "full state"
+          }
+        }
+      }
+    },
+    "/api/action": {
+      "post": {
+        "tags": [
+          "Aggregate"
+        ],
+        "summary": "Legacy action dispatcher",
+        "description": "The original single endpoint, kept so the existing UI keeps working. Prefer the per-service routes above.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "action"
+                ],
+                "properties": {
+                  "action": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "boolean"
+                  },
+                  "id": {},
+                  "text": {
+                    "type": "string"
+                  },
+                  "when": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "google": {
+                    "type": "boolean"
+                  }
+                }
+              },
+              "examples": {
+                "mute": {
+                  "value": {
+                    "action": "mute"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "result"
+          }
+        }
+      }
+    },
+    "/api/calendar/events/{uid}": {
+      "delete": {
+        "tags": [
+          "Google Calendar"
+        ],
+        "summary": "Delete a calendar event",
+        "description": "Removes the event from the calendar — and from Google, since Evolution syncs the deletion up. Use the `uid` returned by `POST /api/calendar/events`.",
+        "parameters": [
+          {
+            "name": "uid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "bc6a9131-4f98-446b-8712-18593fc9f5bf"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "removed"
+          },
+          "404": {
+            "description": "no such event, or not writable"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CommandResult": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "out": {
+            "type": "string"
+          },
+          "err": {
+            "type": "string"
+          }
+        }
+      },
+      "Assistant": {
+        "type": "object",
+        "properties": {
+          "running": {
+            "type": "boolean"
+          },
+          "autostart": {
+            "type": "boolean"
+          },
+          "muted": {
+            "type": "boolean"
+          }
+        }
+      },
+      "Battery": {
+        "type": "object",
+        "properties": {
+          "percent": {
+            "type": "integer",
+            "example": 47
+          },
+          "status": {
+            "type": "string",
+            "example": "Discharging"
+          },
+          "health": {
+            "type": "integer",
+            "description": "% of design capacity",
+            "example": 57
+          }
+        }
+      },
+      "Task": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "reminder",
+              "alarm",
+              "event"
+            ]
+          },
+          "due": {
+            "type": "number",
+            "description": "unix epoch seconds"
+          },
+          "overdue": {
+            "type": "boolean"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "local",
+              "google",
+              "eds"
+            ]
+          }
+        }
+      },
+      "NewTask": {
+        "type": "object",
+        "required": [
+          "text",
+          "when"
+        ],
+        "properties": {
+          "text": {
+            "type": "string",
+            "example": "call mom"
+          },
+          "when": {
+            "type": "string",
+            "example": "30m",
+            "description": "30m, 1h30m, 90s, 14:30, 9am"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "remind",
+              "alarm",
+              "event"
+            ],
+            "default": "remind",
+            "description": "remind/alarm/event — a local entry. To create a REAL calendar event use POST /api/calendar/events."
+          },
+          "google": {
+            "type": "boolean",
+            "default": false,
+            "description": "also create it in Google Tasks"
+          }
+        }
+      },
+      "GoogleStatus": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "connected",
+              "logged_out",
+              "unconfigured",
+              "error"
+            ]
+          },
+          "connected": {
+            "type": "boolean"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "lists": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "example": [
+              "My Tasks"
+            ]
+          },
+          "auto_push": {
+            "type": "boolean"
+          }
+        }
+      },
+      "CalendarStatus": {
+        "type": "object",
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "calendars": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "description": "Evolution source id"
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "included": {
+                  "type": "boolean"
+                },
+                "sample": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "writable": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "can_create": {
+            "type": "boolean",
+            "description": "at least one calendar accepts new events"
+          }
+        }
+      },
+      "SlackStatus": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "unavailable"
+            ]
+          },
+          "connected": {
+            "type": "boolean"
+          },
+          "installed": {
+            "type": "boolean"
+          },
+          "running": {
+            "type": "boolean"
+          },
+          "packaging": {
+            "type": "string",
+            "nullable": true,
+            "example": "snap"
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      },
+      "NewEvent": {
+        "type": "object",
+        "required": [
+          "summary",
+          "start"
+        ],
+        "properties": {
+          "summary": {
+            "type": "string",
+            "example": "Coffee with Priya"
+          },
+          "start": {
+            "type": "string",
+            "example": "+45m",
+            "description": "ISO 2026-07-20T14:30 · clock 14:30 · relative +45m / +2h"
+          },
+          "minutes": {
+            "type": "integer",
+            "default": 30,
+            "description": "duration"
+          }
+        }
+      }
+    }
+  }
+}

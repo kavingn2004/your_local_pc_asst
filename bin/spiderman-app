@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""Spider-Man Assistant — native GTK4 / libadwaita desktop application.
+
+The full control panel as a real GNOME app: no browser, no local web server.
+It talks to the same CLI and library modules the terminal commands use, so the
+app, the CLI and the character always agree.
+
+Slow work (Google sync, calendar reads) runs on worker threads and updates the
+UI through GLib.idle_add, so the window never blocks.
+"""
+import json, os, subprocess, sys, threading
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, GLib, Gio, Gdk
+
+PROJ    = Path(__file__).resolve().parent.parent
+CLI     = PROJ / "bin" / "spiderman"
+VENV_PY = PROJ / ".venv" / "bin" / "python"
+GSYNC   = PROJ / "lib" / "google_sync.py"
+ISYNC   = PROJ / "lib" / "ical_sync.py"
+CWRITE  = PROJ / "lib" / "cal_write.py"
+
+CONF    = Path.home() / ".config" / "spiderman"
+TASKS   = CONF / "tasks.json"
+STATE   = CONF / "state.json"
+ICON    = CONF / "spiderman.png"
+GTOKEN  = CONF / "google" / "token.json"
+GCREDS  = CONF / "google" / "credentials.json"
+SERVICE = "spiderman.service"
+APP_NAME = "Local_Asst"
+LOGO    = CONF / "local-asst.png"
+
+ICONS = {"reminder": "🔔", "alarm": "⏰", "event": "📅"}
+
+
+# ---------------------------------------------------------------- backend
+def _read(p, default):
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return default
+
+
+def run(cmd, timeout=60):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return {"ok": r.returncode == 0, "out": (r.stdout or "").strip(),
+                "err": (r.stderr or "").strip()}
+    except Exception as e:
+        return {"ok": False, "out": "", "err": str(e)}
+
+
+def cli(*args, timeout=40):
+    return run([sys.executable, str(CLI), *args], timeout=timeout)
+
+
+def svc(*args):
+    return run(["systemctl", "--user", *args], timeout=15)
+
+
+def venv(mod, *args, timeout=60):
+    if not VENV_PY.exists():
+        return {"ok": False, "out": "", "err": "venv missing"}
+    return run([str(VENV_PY), str(mod), *args], timeout=timeout)
+
+
+def gather():
+    """Collect everything the window shows. Runs on a worker thread."""
+    st = _read(STATE, {})
+    now = datetime.now().timestamp()
+
+    # battery
+    b = Path("/sys/class/power_supply/BAT0")
+    try:
+        full = int((b / "charge_full").read_text().strip())
+        design = int((b / "charge_full_design").read_text().strip())
+        battery = {"percent": int((b / "capacity").read_text().strip()),
+                   "status": (b / "status").read_text().strip(),
+                   "health": round(full * 100 / design) if design else None}
+    except Exception:
+        battery = None
+
+    # google
+    if not GCREDS.exists():
+        google = {"state": "unconfigured", "lists": []}
+    elif not GTOKEN.exists():
+        google = {"state": "logged_out", "lists": []}
+    else:
+        r = venv(GSYNC, "status", timeout=25)
+        google = {"state": "connected" if "CONNECTED" in r["out"] else "error",
+                  "lists": [l.strip("• ").strip() for l in r["out"].splitlines()
+                            if l.strip().startswith("•")]}
+    google["auto_push"] = bool(st.get("google_auto", False))
+
+    # calendar
+    r = venv(ISYNC, "calendars", timeout=25)
+    cals = []
+    for line in r["out"].splitlines():
+        s = line.strip()
+        if "object(s)" in s:
+            p = s.split()
+            cals.append({"id": p[0], "count": int(p[1]),
+                         "included": "excluded" not in s, "name": ""})
+        elif s.startswith("•") and cals and not cals[-1]["name"]:
+            cals[-1]["name"] = s.lstrip("• ").strip()
+    ev = venv(ISYNC, "events", timeout=25)
+    events = [l.strip() for l in ev["out"].splitlines()
+              if l.strip() and not l.strip().startswith("📅")]
+    w = run([sys.executable, str(CWRITE), "writable"], timeout=20)
+    writable = [x.strip() for x in w["out"].splitlines() if x.strip()]
+    for c in cals:
+        c["writable"] = any(x.startswith(c["id"]) for x in writable)
+
+    chars_dir = CONF / "characters"
+    chars = sorted(f.stem for f in chars_dir.glob("*.png")) if chars_dir.exists() else []
+
+    return {
+        "characters": {"available": chars,
+                       "current": st.get("character", "spider-man")},
+        "assistant": {
+            "running": svc("is-active", SERVICE)["out"] == "active",
+            "autostart": svc("is-enabled", SERVICE)["out"] == "enabled",
+            "muted": bool(st.get("muted", False))},
+        "battery": battery,
+        "tasks": sorted([{"id": t.get("id"), "text": t.get("text", ""),
+                          "type": t.get("type", "reminder"),
+                          "due": t.get("due", 0),
+                          "overdue": t.get("due", 0) < now,
+                          "source": t.get("source", "local")}
+                         for t in _read(TASKS, [])], key=lambda t: t["due"]),
+        "google": google,
+        "calendar": {"calendars": cals, "events": events,
+                     "can_create": bool(writable)},
+        "slack": {"state": "unavailable",
+                  "detail": "Slack renders notifications internally (it never "
+                            "loads libnotify), so they can't be intercepted. "
+                            "A Slack app with user-token scopes is the only route."},
+    }
+
+
+def fmt_when(epoch):
+    if not epoch:
+        return ""
+    d = datetime.fromtimestamp(epoch)
+    today = datetime.now().date()
+    t = d.strftime("%H:%M")
+    if d.date() == today:
+        return t
+    if d.date() == today + timedelta(days=1):
+        return f"tomorrow {t}"
+    return f"{d.strftime('%d %b')} {t}"
+
+
+# ---------------------------------------------------------------- time picker
+class TimePicker:
+    """Date + time, typeable or clickable.
+
+    • At a time  -> a date button (calendar popover) and typeable HH : MM + AM/PM
+    • In a while -> a preset list (10 minutes, 1 hour, ...)
+
+    value() returns ISO 'YYYY-MM-DDTHH:MM' for absolute times (the CLI and
+    cal_write both parse it) or a duration like '45m' for relative ones.
+    """
+
+    PRESETS = [("in 5 minutes", "5m"), ("in 10 minutes", "10m"),
+               ("in 15 minutes", "15m"), ("in 30 minutes", "30m"),
+               ("in 45 minutes", "45m"), ("in 1 hour", "1h"),
+               ("in 2 hours", "2h"), ("in 3 hours", "3h"),
+               ("in 4 hours", "4h"), ("in 8 hours", "8h")]
+
+    def __init__(self):
+        self._cbs = []
+        soon = datetime.now() + timedelta(minutes=30)
+        self.date = soon.date()
+
+        self.mode = Adw.ComboRow(
+            title="When", model=Gtk.StringList.new(["At a date and time", "In a while"]))
+        self.mode.connect("notify::selected", lambda *_: (self._sync(), self._fire()))
+
+        # ---- date: button opening a calendar popover ----
+        self.cal = Gtk.Calendar()
+        self.cal.connect("day-selected", self._on_day)
+        pop_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                          margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+        pop_box.append(self.cal)
+        quick = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                        homogeneous=True)
+        for label, days in (("Today", 0), ("Tomorrow", 1), ("Next week", 7)):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", lambda _b, d=days: self._quick_date(d))
+            quick.append(b)
+        pop_box.append(quick)
+        self.pop = Gtk.Popover(child=pop_box)
+        self.date_btn = Gtk.MenuButton(popover=self.pop, valign=Gtk.Align.CENTER)
+        self.date_row = Adw.ActionRow(title="Date")
+        self.date_row.add_suffix(self.date_btn)
+
+        # ---- time: typeable spin buttons + AM/PM ----
+        self.hour = Gtk.SpinButton.new_with_range(1, 12, 1)
+        self.hour.set_value(soon.hour % 12 or 12)
+        self.minute = Gtk.SpinButton.new_with_range(0, 59, 5)
+        self.minute.set_value(soon.minute)
+        for sp in (self.hour, self.minute):
+            sp.set_wrap(True)
+            sp.set_numeric(True)          # typing is allowed, letters are not
+            sp.set_width_chars(2)
+            sp.set_valign(Gtk.Align.CENTER)
+            sp.connect("value-changed", lambda *_: self._fire())
+        self.minute.connect("output", self._pad)
+        self.ampm = Gtk.DropDown.new_from_strings(["AM", "PM"])
+        self.ampm.set_selected(0 if soon.hour < 12 else 1)
+        self.ampm.set_valign(Gtk.Align.CENTER)
+        self.ampm.connect("notify::selected", lambda *_: self._fire())
+
+        tbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
+                       valign=Gtk.Align.CENTER)
+        tbox.append(self.hour)
+        tbox.append(Gtk.Label(label=":"))
+        tbox.append(self.minute)
+        tbox.append(self.ampm)
+        self.time_row = Adw.ActionRow(title="Time", subtitle="type a number or use the arrows")
+        self.time_row.add_suffix(tbox)
+
+        # ---- relative ----
+        self.preset = Adw.ComboRow(
+            title="From now", model=Gtk.StringList.new([p[0] for p in self.PRESETS]))
+        self.preset.set_selected(3)
+        self.preset.connect("notify::selected", lambda *_: self._fire())
+
+        self._refresh_date_label()
+        self._sync()
+
+    # ---------- date helpers ----------
+    @staticmethod
+    def _pad(spin):
+        spin.set_text(f"{int(spin.get_value()):02d}")
+        return True
+
+    def _on_day(self, cal):
+        d = cal.get_date()
+        self.date = datetime(d.get_year(), d.get_month() + 1, d.get_day_of_month()).date()
+        self._refresh_date_label()
+        self._fire()
+
+    def _quick_date(self, days):
+        self.date = (datetime.now() + timedelta(days=days)).date()
+        g = GLib.DateTime.new_local(self.date.year, self.date.month, self.date.day, 0, 0, 0)
+        self.cal.select_day(g)
+        self._refresh_date_label()
+        self.pop.popdown()
+        self._fire()
+
+    def _refresh_date_label(self):
+        today = datetime.now().date()
+        if self.date == today:
+            label = "Today"
+        elif self.date == today + timedelta(days=1):
+            label = "Tomorrow"
+        else:
+            label = self.date.strftime("%a %d %b")
+        self.date_btn.set_label(label)
+
+    # ---------- plumbing ----------
+    def rows(self):
+        return [self.mode, self.date_row, self.time_row, self.preset]
+
+    def watch(self, cb):
+        self._cbs.append(cb)
+
+    def _fire(self):
+        for cb in self._cbs:
+            cb()
+
+    def _sync(self):
+        absolute = self.mode.get_selected() == 0
+        self.date_row.set_visible(absolute)
+        self.time_row.set_visible(absolute)
+        self.preset.set_visible(not absolute)
+
+    def _when(self):
+        """The chosen moment as a datetime (absolute mode only)."""
+        h = int(self.hour.get_value()) % 12
+        if self.ampm.get_selected() == 1:
+            h += 12
+        return datetime(self.date.year, self.date.month, self.date.day,
+                        h, int(self.minute.get_value()))
+
+    def value(self):
+        if self.mode.get_selected() == 1:
+            return self.PRESETS[self.preset.get_selected()][1]
+        return self._when().strftime("%Y-%m-%dT%H:%M")
+
+    def describe(self):
+        if self.mode.get_selected() == 1:
+            return self.PRESETS[self.preset.get_selected()][0]
+        t = self._when()
+        today = datetime.now().date()
+        clock = t.strftime("%I:%M %p").lstrip("0")
+        if t < datetime.now():
+            return f"⚠️ {t.strftime('%d %b')} at {clock} is in the past"
+        if t.date() == today:
+            return f"today at {clock}"
+        if t.date() == today + timedelta(days=1):
+            return f"tomorrow at {clock}"
+        return f"{t.strftime('%a %d %b')} at {clock}"
+
+
+# ---------------------------------------------------------------- window
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title=APP_NAME)
+        self.set_default_size(560, 760)
+        self.data = None
+        self.busy = False
+
+        self.toasts = Adw.ToastOverlay()
+        self.set_content(self.toasts)
+
+        tv = Adw.ToolbarView()
+        self.toasts.set_child(tv)
+
+        header = Adw.HeaderBar()
+        self.spinner = Gtk.Spinner()
+        header.pack_start(self.spinner)
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh")
+        refresh.connect("clicked", lambda *_: self.reload())
+        header.pack_end(refresh)
+        tv.add_top_bar(header)
+
+        self.page = Adw.PreferencesPage()
+        tv.set_content(self.page)
+
+        self.groups = {}
+        for key, title in (("assistant", "Assistant"), ("character", "Character"),
+                           ("battery", "Battery"),
+                           ("tasks", "Reminders and Events"), ("google", "Google Tasks"),
+                           ("calendar", "Calendar"), ("slack", "Slack")):
+            g = Adw.PreferencesGroup(title=title)
+            self.groups[key] = g
+            self.page.add(g)
+        self._rows = {k: [] for k in self.groups}
+
+        self.reload()
+        GLib.timeout_add_seconds(15, lambda: (self.reload(quiet=True), True)[-1])
+
+    # ---------- helpers ----------
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text[:120], timeout=3))
+
+    def _clear(self, key):
+        for r in self._rows[key]:
+            self.groups[key].remove(r)
+        self._rows[key] = []
+
+    def _add(self, key, row):
+        self.groups[key].add(row)
+        self._rows[key].append(row)
+        return row
+
+    def reload(self, quiet=False):
+        if self.busy:
+            return
+        self.busy = True
+        self.spinner.start()
+
+        def work():
+            try:
+                d = gather()
+            except Exception as e:
+                d = {"error": str(e)}
+            GLib.idle_add(self._apply, d, quiet)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply(self, d, quiet):
+        self.busy = False
+        self.spinner.stop()
+        if "error" in d:
+            self.toast(f"Couldn't load: {d['error']}")
+            return False
+        self.data = d
+        self.build_assistant(); self.build_character(); self.build_battery()
+        self.build_tasks()
+        self.build_google(); self.build_calendar(); self.build_slack()
+        return False
+
+    def act(self, fn, done_msg=None):
+        """Run a backend action off the main thread, then refresh."""
+        self.spinner.start()
+
+        def work():
+            r = fn()
+            GLib.idle_add(after, r)
+
+        def after(r):
+            self.spinner.stop()
+            msg = done_msg or (r.get("out") or r.get("err") or "done")
+            self.toast(msg.split("\n")[0])
+            self.reload(quiet=True)
+            return False
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- sections ----------
+    def build_assistant(self):
+        self._clear("assistant")
+        a = self.data["assistant"]
+
+        row = Adw.ActionRow(title="Character",
+                            subtitle="running on your desktop" if a["running"]
+                                     else "not running")
+        btn = Gtk.Button(label="Stop" if a["running"] else "Start", valign=Gtk.Align.CENTER)
+        btn.add_css_class("destructive-action" if a["running"] else "suggested-action")
+        btn.connect("clicked", lambda *_: self.act(
+            lambda: svc("stop" if a["running"] else "start", SERVICE)))
+        row.add_suffix(btn)
+        self._add("assistant", row)
+
+        sw = Adw.SwitchRow(title="Alerts",
+                           subtitle="speech bubble and voice",
+                           active=not a["muted"])
+        sw.connect("notify::active", lambda w, _: self.act(
+            lambda: cli("on" if w.get_active() else "off")))
+        self._add("assistant", sw)
+
+        au = Adw.SwitchRow(title="Start at login", active=a["autostart"])
+        au.connect("notify::active", lambda w, _: self.act(
+            lambda: svc("enable" if w.get_active() else "disable", "--now", SERVICE)))
+        self._add("assistant", au)
+
+    def build_character(self):
+        self._clear("character")
+        c = self.data.get("characters", {})
+        avail, cur = c.get("available", []), c.get("current")
+        if not avail:
+            self._add("character", Adw.ActionRow(
+                title="No characters installed",
+                subtitle="tools/make_characters.py <folder of images>"))
+            return
+        self.groups["character"].set_description(
+            f"{len(avail)} available — click one to switch")
+        for key in avail:
+            row = Adw.ActionRow(title=key.replace("-", " ").title(),
+                                activatable=True)
+            png = CONF / "characters" / f"{key}.png"
+            if png.exists():
+                img = Gtk.Image.new_from_file(str(png))
+                img.set_pixel_size(44)
+                row.add_prefix(img)
+            if key == cur:
+                row.add_suffix(Gtk.Image(icon_name="object-select-symbolic"))
+                row.set_subtitle("current")
+            row.connect("activated", lambda _r, k=key: self.act(
+                lambda: cli("character", "set", k)))
+            self._add("character", row)
+
+    def build_battery(self):
+        self._clear("battery")
+        b = self.data["battery"]
+        if not b:
+            self._add("battery", Adw.ActionRow(title="No battery detected"))
+            return
+        charging = "charg" in b["status"].lower()
+        row = Adw.ActionRow(title=f"{b['percent']}%  ·  {b['status']}")
+        if b.get("health") is not None:
+            row.set_subtitle(f"health {b['health']}% of design capacity")
+        bar = Gtk.LevelBar(min_value=0, max_value=100, value=b["percent"],
+                           valign=Gtk.Align.CENTER, hexpand=True,
+                           width_request=140)
+        row.add_suffix(bar)
+        self._add("battery", row)
+        if b["percent"] <= 20 and not charging:
+            w = Adw.ActionRow(title="Battery low", subtitle="Plug in soon")
+            w.add_prefix(Gtk.Image(icon_name="battery-caution-symbolic"))
+            self._add("battery", w)
+
+    def build_tasks(self):
+        self._clear("tasks")
+        g = self.groups["tasks"]
+        tasks = self.data["tasks"]
+        g.set_description(f"{len(tasks)} scheduled" if tasks else "Nothing scheduled")
+
+        for t in tasks:
+            row = Adw.ActionRow(
+                title=f"{ICONS.get(t['type'], '🔔')}  {t['text']}",
+                subtitle=("overdue · " if t["overdue"] else "") + fmt_when(t["due"])
+                         + ("" if t["source"] == "local" else f"  ·  {t['source']}"))
+            rm = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                            tooltip_text="Cancel")
+            rm.add_css_class("flat")
+            rm.connect("clicked", lambda _b, i=t["id"]: self.act(
+                lambda: cli("cancel", str(i))))
+            row.add_suffix(rm)
+            self._add("tasks", row)
+
+        # --- add new ---
+        self.e_text = Adw.EntryRow(title="Remind me to…")
+        self._add("tasks", self.e_text)
+
+        self.kind = Adw.ComboRow(
+            title="Type",
+            model=Gtk.StringList.new(["🔔  Reminder", "⏰  Alarm", "📅  Event"]))
+        self.kind.connect("notify::selected", lambda *_: self._kind_hint())
+        self._add("tasks", self.kind)
+        self._kind_hint()
+
+        self.picker = TimePicker()
+        for r in self.picker.rows():
+            self._add("tasks", r)
+        self.picker.watch(self._preview)
+
+        opts = Adw.ActionRow(title="Also add to Google Tasks")
+        self.chk_google = Gtk.Switch(valign=Gtk.Align.CENTER,
+                                     sensitive=self.data["google"]["state"] == "connected")
+        opts.add_suffix(self.chk_google)
+        self._add("tasks", opts)
+
+        self.add_row = Adw.ActionRow(title="Add")
+        btn = Gtk.Button(label="Add", valign=Gtk.Align.CENTER)
+        btn.add_css_class("suggested-action")
+        btn.connect("clicked", lambda *_: self.add_task())
+        self.add_row.add_suffix(btn)
+        self._add("tasks", self.add_row)
+        self._preview()
+
+    KINDS = ["remind", "alarm", "event"]
+    KIND_HINTS = ["a normal notification with voice",
+                  "urgent alert — stays on screen longer",
+                  "a calendar-style entry, announced like an event"]
+
+    def _kind_hint(self):
+        self.kind.set_subtitle(self.KIND_HINTS[self.kind.get_selected()])
+
+    def _preview(self):
+        if hasattr(self, "add_row"):
+            self.add_row.set_subtitle(f"will fire {self.picker.describe()}")
+
+    def add_task(self):
+        text = self.e_text.get_text().strip()
+        if not text:
+            self.toast("Enter what to be reminded of")
+            return
+        kind = self.KINDS[self.kind.get_selected()]
+        args = [kind, text, self.picker.value()]
+        if self.chk_google.get_active():
+            args.append("--google")
+        self.e_text.set_text("")
+        self.act(lambda: cli(*args))
+
+    def build_google(self):
+        self._clear("google")
+        g = self.data["google"]
+        connected = g["state"] == "connected"
+        row = Adw.ActionRow(title="Connection",
+                            subtitle=", ".join(g["lists"]) if connected
+                                     else g["state"].replace("_", " "))
+        row.add_prefix(Gtk.Image(icon_name="emblem-ok-symbolic" if connected
+                                 else "dialog-warning-symbolic"))
+        self._add("google", row)
+
+        if connected:
+            sw = Adw.SwitchRow(title="Auto-push new reminders",
+                               subtitle="send every reminder to Google Tasks",
+                               active=g["auto_push"])
+            sw.connect("notify::active", lambda w, _: self.act(
+                lambda: cli("google", "auto", "on" if w.get_active() else "off")))
+            self._add("google", sw)
+
+            s = Adw.ActionRow(title="Sync now", subtitle="push pending and pull from Google")
+            b = Gtk.Button(label="Sync", valign=Gtk.Align.CENTER)
+            b.connect("clicked", lambda *_: self.act(lambda: venv(GSYNC, "sync")))
+            s.add_suffix(b)
+            self._add("google", s)
+        else:
+            hint = ("Run 'spiderman google login' in a terminal"
+                    if g["state"] == "logged_out"
+                    else "Google Cloud setup not finished")
+            self._add("google", Adw.ActionRow(title="Not connected", subtitle=hint))
+
+    def build_calendar(self):
+        self._clear("calendar")
+        c = self.data["calendar"]
+        if not c["calendars"]:
+            self._add("calendar", Adw.ActionRow(
+                title="No calendars", subtitle="Add an account in Settings → Online Accounts"))
+            return
+
+        for cal in c["calendars"]:
+            sw = Adw.SwitchRow(title=cal["name"] or cal["id"],
+                               subtitle=f"{cal['count']} entries"
+                                        + ("  ·  writable" if cal.get("writable") else "  ·  read-only"),
+                               active=cal["included"])
+            sw.connect("notify::active", lambda w, _, i=cal["id"]: self.act(
+                lambda: venv(ISYNC, "include" if w.get_active() else "exclude", i)))
+            self._add("calendar", sw)
+
+        ev = c["events"]
+        if ev:
+            exp = Adw.ExpanderRow(title="Upcoming", subtitle=f"{len(ev)} in the next 24h")
+            for e in ev[:8]:
+                exp.add_row(Adw.ActionRow(title=e))
+            self._add("calendar", exp)
+        else:
+            self._add("calendar", Adw.ActionRow(title="Upcoming",
+                                                subtitle="nothing in the next 24 hours"))
+
+        if c["can_create"]:
+            self.c_sum = Adw.EntryRow(title="New event")
+            self._add("calendar", self.c_sum)
+            self.c_picker = TimePicker()
+            for r in self.c_picker.rows():
+                self._add("calendar", r)
+            self.c_dur = Adw.ComboRow(
+                title="Duration",
+                model=Gtk.StringList.new(["15 min", "30 min", "45 min", "1 hour", "2 hours"]))
+            self.c_dur.set_selected(1)
+            self._add("calendar", self.c_dur)
+
+            row = Adw.ActionRow(title="Create in calendar", subtitle="syncs to Google")
+            b = Gtk.Button(label="Create", valign=Gtk.Align.CENTER)
+            b.add_css_class("suggested-action")
+            b.connect("clicked", lambda *_: self.create_event())
+            row.add_suffix(b)
+            self._add("calendar", row)
+
+        r = Adw.ActionRow(title="Refresh from Google")
+        b = Gtk.Button(label="Refresh", valign=Gtk.Align.CENTER)
+        b.connect("clicked", lambda *_: self.act(lambda: venv(ISYNC, "refresh")))
+        r.add_suffix(b)
+        self._add("calendar", r)
+
+    DURATIONS = [15, 30, 45, 60, 120]
+
+    def create_event(self):
+        name = self.c_sum.get_text().strip()
+        if not name:
+            self.toast("Enter an event name")
+            return
+        when = self.c_picker.value()
+        # cal_write wants "+45m" for relative starts, "2:30pm" for clock times
+        if when.endswith(("m", "h")) and when[:-1].isdigit():
+            when = "+" + when
+        mins = self.DURATIONS[self.c_dur.get_selected()]
+        self.c_sum.set_text("")
+        self.act(lambda: run([sys.executable, str(CWRITE), "create", name, when,
+                              str(mins)], timeout=45))
+
+    def build_slack(self):
+        self._clear("slack")
+        row = Adw.ActionRow(title="Message announcements", subtitle="unavailable")
+        row.add_prefix(Gtk.Image(icon_name="dialog-warning-symbolic"))
+        self._add("slack", row)
+        d = Adw.ActionRow(title=self.data["slack"]["detail"])
+        d.set_title_lines(4)
+        self._add("slack", d)
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id="com.stacx.LocalAsst",
+                         flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+
+    def do_activate(self):
+        win = self.props.active_window or Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))

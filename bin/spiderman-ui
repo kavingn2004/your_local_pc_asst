@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""Local control panel + REST API for the Spider-Man assistant.
+
+Serves ui/ (React, vendored — no build step), Swagger UI at /docs, and a REST
+API split by service: /api/assistant, /api/tasks, /api/google, /api/calendar,
+/api/slack.
+
+Bound to 127.0.0.1 only. This controls your assistant and exposes your task
+list, so it must never be reachable from the network — the loopback binding is
+the security boundary; there is no auth.
+
+    spiderman ui                # start and open the browser
+    spiderman ui --no-browser
+"""
+import json, re, subprocess, sys, threading, webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from datetime import datetime
+
+PROJ    = Path(__file__).resolve().parent.parent
+UI_DIR  = PROJ / "ui"
+VENV_PY = PROJ / ".venv" / "bin" / "python"
+GSYNC   = PROJ / "lib" / "google_sync.py"
+ISYNC   = PROJ / "lib" / "ical_sync.py"
+CWRITE  = PROJ / "lib" / "cal_write.py"
+CLI     = PROJ / "bin" / "spiderman"
+
+CONF    = Path.home() / ".config" / "spiderman"
+TASKS   = CONF / "tasks.json"
+STATE   = CONF / "state.json"
+GTOKEN  = CONF / "google" / "token.json"
+GCREDS  = CONF / "google" / "credentials.json"
+
+HOST, PORT = "127.0.0.1", 8777
+SERVICE = "spiderman.service"
+
+
+# ---------------------------------------------------------------- helpers
+def _read(p, default):
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return default
+
+
+def save_state(s):
+    STATE.write_text(json.dumps(s, indent=2))
+
+
+def run(cmd, timeout=60):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return {"ok": r.returncode == 0,
+                "out": (r.stdout or "").strip(),
+                "err": (r.stderr or "").strip()}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "out": "", "err": "timed out"}
+    except Exception as e:
+        return {"ok": False, "out": "", "err": str(e)}
+
+
+def svc(*args):
+    return run(["systemctl", "--user", *args], timeout=15)
+
+
+def venv(mod, *args, timeout=60):
+    if not VENV_PY.exists():
+        return {"ok": False, "out": "", "err": "venv missing — run ./install.sh"}
+    return run([str(VENV_PY), str(mod), *args], timeout=timeout)
+
+
+# ---------------------------------------------------------------- resources
+def battery():
+    b = Path("/sys/class/power_supply/BAT0")
+    try:
+        full = int((b / "charge_full").read_text().strip())
+        design = int((b / "charge_full_design").read_text().strip())
+        return {"percent": int((b / "capacity").read_text().strip()),
+                "status": (b / "status").read_text().strip(),
+                "health": round(full * 100 / design) if design else None}
+    except Exception:
+        return None
+
+
+def assistant_status():
+    st = _read(STATE, {})
+    return {"running": svc("is-active", SERVICE)["out"] == "active",
+            "autostart": svc("is-enabled", SERVICE)["out"] == "enabled",
+            "muted": bool(st.get("muted", False))}
+
+
+def task_list():
+    now = datetime.now().timestamp()
+    return sorted([{"id": t.get("id"), "text": t.get("text", ""),
+                    "type": t.get("type", "reminder"), "due": t.get("due", 0),
+                    "overdue": t.get("due", 0) < now,
+                    "source": t.get("source", "local")}
+                   for t in _read(TASKS, [])], key=lambda t: t["due"])
+
+
+def google_status():
+    if not GCREDS.exists():
+        return {"state": "unconfigured", "connected": False,
+                "detail": "No credentials.json — Google Cloud setup not done.",
+                "lists": [], "scopes": [], "auto_push": False}
+    if not GTOKEN.exists():
+        return {"state": "logged_out", "connected": False,
+                "detail": "Not connected. POST /api/google/login",
+                "lists": [], "scopes": [], "auto_push": False}
+    r = venv(GSYNC, "status", timeout=30)
+    connected = "CONNECTED" in r["out"]
+    return {"state": "connected" if connected else "error",
+            "connected": connected,
+            "detail": r["out"] or r["err"],
+            "scopes": _read(GTOKEN, {}).get("scopes", []),
+            "lists": [l.strip("• ").strip() for l in r["out"].splitlines()
+                      if l.strip().startswith("•")],
+            "auto_push": bool(_read(STATE, {}).get("google_auto", False))}
+
+
+def calendar_status():
+    r = venv(ISYNC, "calendars", timeout=30)
+    cals = []
+    for line in r["out"].splitlines():
+        s = line.strip()
+        if "object(s)" in s:
+            p = s.split()
+            cals.append({"id": p[0], "count": int(p[1]),
+                         "included": "excluded" not in s, "sample": []})
+        elif s.startswith("•") and cals:
+            cals[-1]["sample"].append(s.lstrip("• ").strip())
+    w = run([sys.executable, str(CWRITE), "writable"], timeout=20)
+    writable = [x.strip() for x in w["out"].splitlines() if x.strip()]
+    for c in cals:
+        c["writable"] = any(x.startswith(c["id"]) for x in writable)
+    return {"available": bool(cals), "calendars": cals,
+            "can_create": bool(writable),
+            "detail": r["out"] or r["err"]}
+
+
+def calendar_events():
+    r = venv(ISYNC, "events", timeout=30)
+    return [l.strip() for l in r["out"].splitlines()
+            if l.strip() and not l.strip().startswith("📅")]
+
+
+SLACK_DETAIL = (
+    "Not available. Slack is installed as a snap and its desktop notifications "
+    "never reach the D-Bus session bus, so they cannot be intercepted (verified "
+    "by capture — only non-Slack notifications appear). Options: install the "
+    ".deb build of Slack, or create a Slack app with Socket Mode, which needs "
+    "workspace admin approval.")
+
+
+def slack_status():
+    return {"state": "unavailable", "connected": False,
+            "installed": Path("/snap/slack").exists(),
+            "running": bool(run(["pgrep", "-f", "usr/lib/slack/slack"],
+                                timeout=5)["out"]),
+            "packaging": "snap" if Path("/snap/slack").exists() else None,
+            "detail": SLACK_DETAIL}
+
+
+def full_status():
+    return {"assistant": assistant_status(), "battery": battery(),
+            "tasks": task_list(), "google": google_status(),
+            "calendar": {**calendar_status(), "events": calendar_events()},
+            "slack": slack_status()}
+
+
+# ---------------------------------------------------------------- actions
+def add_task(body):
+    text = str(body.get("text", "")).strip()
+    when = str(body.get("when", "")).strip()
+    if not text or not when:
+        return 400, {"ok": False, "err": "text and when are required"}
+    cmd = [sys.executable, str(CLI), body.get("kind", "remind"), text, when]
+    if body.get("google"):
+        cmd.append("--google")
+    r = run(cmd, timeout=30)
+    return (201 if r["ok"] else 400), r
+
+
+def legacy_action(body):
+    """The original single-endpoint dispatcher, kept for the React UI."""
+    a = body.get("action", "")
+    table = {
+        "start":  lambda: svc("start", SERVICE),
+        "stop":   lambda: svc("stop", SERVICE),
+        "enable": lambda: svc("enable", "--now", SERVICE),
+        "disable": lambda: svc("disable", "--now", SERVICE),
+        "google_sync":   lambda: venv(GSYNC, "sync"),
+        "google_logout": lambda: venv(GSYNC, "logout"),
+        "calendar_sync":    lambda: venv(ISYNC, "sync"),
+        "calendar_refresh": lambda: venv(ISYNC, "refresh"),
+    }
+    if a in table:
+        return table[a]()
+    if a in ("mute", "unmute"):
+        s = _read(STATE, {}); s["muted"] = (a == "mute"); save_state(s)
+        return {"ok": True, "out": f"alerts {'muted' if a == 'mute' else 'on'}"}
+    if a == "google_auto":
+        s = _read(STATE, {}); s["google_auto"] = bool(body.get("value")); save_state(s)
+        return {"ok": True, "out": f"auto-push {'on' if s['google_auto'] else 'off'}"}
+    if a == "calendar_exclude":
+        return venv(ISYNC, "exclude", str(body.get("id", "")))
+    if a == "calendar_include":
+        return venv(ISYNC, "include", str(body.get("id", "")))
+    if a == "add_task":
+        return add_task(body)[1]
+    if a == "cancel_task":
+        return run([sys.executable, str(CLI), "cancel", str(body.get("id"))], timeout=15)
+    return {"ok": False, "err": f"unknown action: {a}"}
+
+
+# ---------------------------------------------------------------- routes
+def route(method, path, body):
+    """Return (status_code, payload)."""
+
+    # ---- assistant -------------------------------------------------
+    if path == "/api/assistant":
+        if method == "GET":
+            return 200, assistant_status()
+        if method == "PATCH":
+            out = []
+            if "muted" in body:
+                s = _read(STATE, {}); s["muted"] = bool(body["muted"]); save_state(s)
+                out.append(f"muted={s['muted']}")
+            if "autostart" in body:
+                svc("enable" if body["autostart"] else "disable", "--now", SERVICE)
+                out.append(f"autostart={bool(body['autostart'])}")
+            if not out:
+                return 400, {"ok": False, "err": "nothing to change"}
+            return 200, {"ok": True, "out": ", ".join(out), **assistant_status()}
+    if path == "/api/assistant/start" and method == "POST":
+        return 200, svc("start", SERVICE)
+    if path == "/api/assistant/stop" and method == "POST":
+        return 200, svc("stop", SERVICE)
+
+    # ---- battery ---------------------------------------------------
+    if path == "/api/battery" and method == "GET":
+        b = battery()
+        return (200, b) if b else (404, {"err": "no battery"})
+
+    # ---- tasks -----------------------------------------------------
+    if path == "/api/tasks":
+        if method == "GET":
+            return 200, {"tasks": task_list()}
+        if method == "POST":
+            return add_task(body)
+    m = re.fullmatch(r"/api/tasks/(\d+)", path)
+    if m and method == "DELETE":
+        r = run([sys.executable, str(CLI), "cancel", m.group(1)], timeout=15)
+        return (200 if r["ok"] else 404), r
+
+    # ---- google tasks ----------------------------------------------
+    if path == "/api/google":
+        if method == "GET":
+            return 200, google_status()
+        if method == "PATCH":
+            if "auto_push" not in body:
+                return 400, {"ok": False, "err": "auto_push is required"}
+            s = _read(STATE, {}); s["google_auto"] = bool(body["auto_push"]); save_state(s)
+            return 200, {"ok": True, "auto_push": s["google_auto"]}
+    if path == "/api/google/login" and method == "POST":
+        if not GCREDS.exists():
+            return 409, {"ok": False, "err": "credentials.json missing — finish the Cloud setup"}
+        try:
+            subprocess.Popen([str(VENV_PY), str(GSYNC), "login"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            return 500, {"ok": False, "err": str(e)}
+        return 202, {"ok": True,
+                     "out": "Browser opened for Google consent. Approve it, "
+                            "then GET /api/google to confirm."}
+    if path == "/api/google/logout" and method == "POST":
+        return 200, venv(GSYNC, "logout")
+    if path == "/api/google/sync" and method == "POST":
+        r = venv(GSYNC, "sync")
+        return (200 if r["ok"] else 502), r
+    if path == "/api/google/tasks" and method == "GET":
+        r = venv(GSYNC, "tasks", timeout=30)
+        if not r["ok"]:
+            return 502, r
+        return 200, {"raw": r["out"],
+                     "tasks": [l.strip() for l in r["out"].splitlines()
+                               if l.strip() and not l.strip().startswith("🕷️")
+                               and not l.strip().startswith("🕸️")]}
+
+    # ---- google calendar -------------------------------------------
+    if path == "/api/calendar" and method == "GET":
+        return 200, calendar_status()
+    if path == "/api/calendar/events":
+        if method == "GET":
+            return 200, {"events": calendar_events()}
+        if method == "POST":
+            summary = str(body.get("summary", "")).strip()
+            start   = str(body.get("start", "")).strip()
+            if not summary or not start:
+                return 400, {"ok": False, "err": "summary and start are required"}
+            cmd = [sys.executable, str(CWRITE), "create", summary, start,
+                   str(int(body.get("minutes", 30)))]
+            r = run(cmd, timeout=40)
+            if not r["ok"]:
+                return 502, r
+            return 201, r
+    if path == "/api/calendar/sync" and method == "POST":
+        r = venv(ISYNC, "sync")
+        return (200 if r["ok"] else 502), r
+    if path == "/api/calendar/refresh" and method == "POST":
+        r = venv(ISYNC, "refresh")
+        return (200 if r["ok"] else 502), r
+    m = re.fullmatch(r"/api/calendar/events/([^/]{4,200})", path)
+    if m and method == "DELETE":
+        r = run([sys.executable, str(CWRITE), "delete", m.group(1)], timeout=40)
+        return (200 if r["ok"] else 404), r
+    m = re.fullmatch(r"/api/calendar/calendars/([0-9a-f]{4,64})", path)
+    if m and method == "PATCH":
+        if "included" not in body:
+            return 400, {"ok": False, "err": "included is required"}
+        cmd = "include" if body["included"] else "exclude"
+        r = venv(ISYNC, cmd, m.group(1))
+        return (200 if r["ok"] else 400), r
+
+    # ---- slack ------------------------------------------------------
+    if path == "/api/slack" and method == "GET":
+        return 200, slack_status()
+    if path in ("/api/slack/connect", "/api/slack/messages") and method in ("POST", "GET"):
+        return 501, {"ok": False, "state": "unavailable", "err": SLACK_DETAIL}
+
+    # ---- aggregate / legacy ----------------------------------------
+    if path == "/api/status" and method == "GET":
+        return 200, full_status()
+    if path == "/api/action" and method == "POST":
+        r = legacy_action(body)
+        return 200, r
+
+    return 404, {"err": f"no route for {method} {path}"}
+
+
+# ---------------------------------------------------------------- server
+CTYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css",
+          ".png": "image/png", ".json": "application/json",
+          ".svg": "image/svg+xml", ".map": "application/json"}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "SpiderManUI/1.1"
+
+    def log_message(self, *a):
+        pass                                    # keep the terminal quiet
+
+    def _send(self, code, payload, ctype="application/json"):
+        data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(n) or b"{}")
+        except Exception:
+            return None
+
+    def _api(self, method):
+        body = self._body() if method in ("POST", "PATCH", "PUT") else {}
+        if body is None:
+            return self._send(400, {"err": "malformed JSON body"})
+        code, payload = route(method, self.path.split("?")[0], body or {})
+        self._send(code, payload)
+
+    def do_POST(self):   self._api("POST")
+    def do_PATCH(self):  self._api("PATCH")
+    def do_DELETE(self): self._api("DELETE")
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path.startswith("/api/"):
+            return self._api("GET")
+        rel = ("docs.html" if path in ("/docs", "/docs/", "/swagger")
+               else "index.html" if path in ("/", "") else path.lstrip("/"))
+        target = (UI_DIR / rel).resolve()
+        if not str(target).startswith(str(UI_DIR.resolve())) or not target.is_file():
+            return self._send(404, {"err": "not found"})
+        self._send(200, target.read_bytes(),
+                   CTYPES.get(target.suffix, "application/octet-stream"))
+
+
+def already_running(url):
+    """True if our server is already serving on the port.
+
+    Launching from the app grid must not fail with 'address already in use' —
+    if an instance is up we just focus it by opening the browser.
+    """
+    try:
+        import urllib.request
+        with urllib.request.urlopen(url + "api/assistant", timeout=2) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def main():
+    if not UI_DIR.exists():
+        print(f"❌ UI folder missing: {UI_DIR}", file=sys.stderr)
+        return 1
+    url = f"http://{HOST}:{PORT}/"
+
+    if already_running(url):
+        print(f"🕷️  Control panel already running — opening {url}")
+        if "--no-browser" not in sys.argv:
+            webbrowser.open(url)
+        return 0
+
+    try:
+        srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    except OSError as e:
+        print(f"❌ Can't bind {HOST}:{PORT} — {e}", file=sys.stderr)
+        print("   Something else is using the port. Free it with: fuser -k 8777/tcp",
+              file=sys.stderr)
+        return 1
+    print(f"🕷️  Spider-Man control panel : {url}")
+    print(f"    API docs (Swagger)       : {url}docs")
+    print("    local only — Ctrl+C to stop")
+    if "--no-browser" not in sys.argv:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

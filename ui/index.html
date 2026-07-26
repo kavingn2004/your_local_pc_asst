@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spider-Man Assistant</title>
+<style>
+  :root {
+    --red:#ce2027; --red-dark:#a4181e; --blue:#2a4a8b;
+    --bg:#0f1216; --card:#171b21; --card2:#1e232b;
+    --line:#2a313b; --text:#e8edf4; --dim:#94a0b0;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f4f6f9; --card:#fff; --card2:#f0f3f7;
+            --line:#dde3ec; --text:#161b22; --dim:#5b6775; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:15px/1.5 system-ui,-apple-system,"Ubuntu",sans-serif; }
+  .wrap { max-width:940px; margin:0 auto; padding:24px 18px 60px; }
+  header { display:flex; align-items:center; gap:14px; margin-bottom:22px; }
+  .logo { width:44px; height:44px; border-radius:50%; background:var(--red);
+          display:grid; place-items:center; font-size:22px;
+          box-shadow:0 0 0 3px rgba(206,32,39,.25); }
+  h1 { font-size:21px; margin:0; font-weight:750; letter-spacing:-.2px; }
+  .sub { color:var(--dim); font-size:13px; }
+  .grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); }
+  .card { background:var(--card); border:1px solid var(--line);
+          border-radius:14px; padding:16px 18px; }
+  .card h2 { font-size:14px; margin:0 0 12px; text-transform:uppercase;
+             letter-spacing:.6px; color:var(--dim); font-weight:700;
+             display:flex; align-items:center; gap:8px; }
+  .row { display:flex; align-items:center; justify-content:space-between;
+         gap:12px; padding:8px 0; border-bottom:1px solid var(--line); }
+  .row:last-child { border-bottom:0; }
+  .label { font-size:14px; }
+  .hint { color:var(--dim); font-size:12.5px; margin-top:2px; }
+  .pill { font-size:11.5px; font-weight:700; padding:3px 9px; border-radius:999px;
+          text-transform:uppercase; letter-spacing:.4px; white-space:nowrap; }
+  .pill.ok   { background:rgba(63,185,80,.16);  color:var(--ok); }
+  .pill.warn { background:rgba(210,153,34,.16); color:var(--warn); }
+  .pill.bad  { background:rgba(248,81,73,.16);  color:var(--bad); }
+  .pill.dim  { background:var(--card2); color:var(--dim); }
+  button { font:inherit; font-size:13px; font-weight:650; cursor:pointer;
+           border-radius:9px; padding:7px 13px; border:1px solid var(--line);
+           background:var(--card2); color:var(--text); transition:.15s; }
+  button:hover:not(:disabled) { border-color:var(--red); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  button.primary { background:var(--red); border-color:var(--red); color:#fff; }
+  button.primary:hover:not(:disabled) { background:var(--red-dark); }
+  .switch { position:relative; width:44px; height:25px; flex:none; }
+  .switch input { opacity:0; width:0; height:0; }
+  .slider { position:absolute; inset:0; background:var(--line);
+            border-radius:999px; transition:.2s; }
+  .slider:before { content:""; position:absolute; height:19px; width:19px;
+            left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s; }
+  input:checked + .slider { background:var(--ok); }
+  input:checked + .slider:before { transform:translateX(19px); }
+  .tasks { list-style:none; margin:0; padding:0; }
+  .tasks li { display:flex; align-items:center; gap:10px; padding:9px 0;
+              border-bottom:1px solid var(--line); }
+  .tasks li:last-child { border-bottom:0; }
+  .when { font-variant-numeric:tabular-nums; color:var(--dim);
+          font-size:12.5px; white-space:nowrap; }
+  .overdue { color:var(--bad); }
+  .grow { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+          white-space:nowrap; }
+  .x { background:none; border:0; color:var(--dim); font-size:17px;
+       padding:2px 6px; line-height:1; }
+  .x:hover { color:var(--bad); }
+  .addrow { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  input[type=text] { flex:1; min-width:120px; font:inherit; font-size:13.5px;
+        padding:7px 11px; border-radius:9px; border:1px solid var(--line);
+        background:var(--bg); color:var(--text); }
+  input[type=text]:focus { outline:none; border-color:var(--red); }
+  .when-in { max-width:104px; flex:none; }
+  .chk { display:flex; align-items:center; gap:6px; font-size:12.5px;
+         color:var(--dim); }
+  .note { background:var(--card2); border-left:3px solid var(--warn);
+          padding:10px 12px; border-radius:0 8px 8px 0; font-size:12.5px;
+          color:var(--dim); margin-top:10px; }
+  .note.bad { border-left-color:var(--bad); }
+  .bar { height:6px; background:var(--card2); border-radius:99px;
+         overflow:hidden; margin-top:6px; }
+  .bar span { display:block; height:100%; border-radius:99px; }
+  .list { margin:6px 0 0; padding-left:18px; color:var(--dim); font-size:12.5px; }
+  .toast { position:fixed; left:50%; bottom:24px; transform:translateX(-50%);
+           background:var(--card); border:1px solid var(--line);
+           border-left:3px solid var(--ok); padding:10px 16px; border-radius:10px;
+           font-size:13px; box-shadow:0 8px 28px rgba(0,0,0,.35); z-index:9; }
+  .toast.bad { border-left-color:var(--bad); }
+  .foot { text-align:center; color:var(--dim); font-size:12px; margin-top:26px; }
+</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="/vendor/react.js"></script>
+  <script src="/vendor/react-dom.js"></script>
+  <script src="/vendor/htm.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

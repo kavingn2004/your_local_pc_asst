@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+"""Spider-Man — a local assistant: reminders, alarms, and battery alerts
+with themed desktop notifications + spoken voice."""
+import sys, os, json, time, subprocess, random, re
+from pathlib import Path
+from datetime import datetime, timedelta
+
+APP   = "Local_Asst"
+CONF  = Path.home() / ".config" / "spiderman"
+TASKS = CONF / "tasks.json"
+STATE = CONF / "state.json"
+ICON  = CONF / "spiderman.png"
+BAT   = Path("/sys/class/power_supply/BAT0")
+SERVICE = "spiderman.service"
+CONF.mkdir(parents=True, exist_ok=True)
+
+# ---------------- storage ----------------
+def _read_json(p, default):
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return default
+
+def load_tasks():  return _read_json(TASKS, [])
+def save_tasks(t): TASKS.write_text(json.dumps(t, indent=2))
+def load_state():  return _read_json(STATE, {"muted": False})
+def save_state(s): STATE.write_text(json.dumps(s, indent=2))
+
+def char_name():
+    """Display name of the active character — the assistant is named after it."""
+    key = load_state().get("character", "spider-man")
+    return key.replace("-", " ").title()
+
+# ---------------- alerts ----------------
+def notify(title, body, urgency="normal"):
+    try:
+        subprocess.Popen(["notify-send", "-a", APP, "-i", str(ICON),
+                          "-u", urgency, title, body])
+    except Exception:
+        pass
+
+def speak(text):
+    try:
+        # slightly lower, steady voice
+        subprocess.Popen(["spd-say", "-r", "-10", "-p", "-10", text])
+    except Exception:
+        pass
+
+def alert(title, body, voice=None, urgency="normal", force=False):
+    if not force and load_state().get("muted"):
+        return
+    notify(title, body, urgency)
+    speak(voice or body)
+
+# ---------------- Spider-Man voice lines ----------------
+LEADS = [
+    "Your friendly neighborhood Spider-Man here.",
+    "Spider-sense tingling.",
+    "Hey, web-head.",
+    "Spider-Man to the rescue.",
+]
+def themed_voice(kind, text):
+    lead = random.choice(LEADS)
+    if kind == "reminder":
+        return f"{lead} Reminder: {text}"
+    if kind == "alarm":
+        return f"{lead} Alarm time. {text}"
+    return f"{lead} {text}"
+
+# ---------------- time parsing ----------------
+DUR_RE = re.compile(r'(\d+)\s*(h|hr|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)', re.I)
+
+def parse_when(s):
+    """Return epoch seconds for a duration ('30m','1h30m','90s') or a
+    clock time ('14:30','9:00','9am','7pm'). Raises ValueError if unclear."""
+    s = s.strip()
+    # full date+time first: "2026-07-20T14:30" or "2026-07-20 14:30"
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        pass
+    s = s.lower()
+    # duration
+    matches = DUR_RE.findall(s)
+    if matches and re.fullmatch(r'[\dhmsrinuteco\s]+', s):
+        total = 0
+        for val, unit in matches:
+            val = int(val)
+            u = unit[0]
+            total += val*3600 if u == 'h' else val*60 if u == 'm' else val
+        if total > 0:
+            return time.time() + total
+    # clock time  HH:MM  or  Hpm/Ham
+    m = re.fullmatch(r'(\d{1,2}):(\d{2})\s*(am|pm)?', s)
+    if not m:
+        m = re.fullmatch(r'(\d{1,2})\s*(am|pm)', s)
+        if m:
+            hh = int(m.group(1)) % 12
+            if m.group(2) == 'pm': hh += 12
+            mm = 0
+        else:
+            raise ValueError(f"couldn't understand time: '{s}'")
+    else:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        ap = m.group(3)
+        if ap:
+            hh = hh % 12 + (12 if ap == 'pm' else 0)
+    now = datetime.now()
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return target.timestamp()
+
+def fmt_due(epoch):
+    dt = datetime.fromtimestamp(epoch)
+    today = datetime.now().date()
+    day = "today" if dt.date() == today else ("tomorrow" if dt.date() == today + timedelta(days=1) else dt.strftime("%d %b"))
+    return f"{day} {dt.strftime('%H:%M')}"
+
+# ---------------- task ops ----------------
+def add_task(kind, text, when, push=False):
+    due = parse_when(when)
+    tasks = load_tasks()
+    tid = (max([t["id"] for t in tasks], default=0) + 1)
+    rec = {"id": tid, "type": kind, "text": text, "due": due, "fired": False}
+    if push:
+        rec["push"] = True          # sync will create it in Google Tasks
+        rec["source"] = "local"
+    tasks.append(rec)
+    save_tasks(tasks)
+    return tid, due
+
+def _pop_flag(args, *names):
+    """Remove a flag from the arg list; return (remaining_args, was_present)."""
+    rest = [a for a in args if a not in names]
+    return rest, len(rest) != len(args)
+
+def _google_available():
+    proj = Path(__file__).resolve().parent.parent
+    return ((proj / ".venv" / "bin" / "python").exists()
+            and (Path.home() / ".config/spiderman/google/token.json").exists())
+
+def _trigger_sync():
+    """Kick off a background sync so it reaches Google right away."""
+    proj = Path(__file__).resolve().parent.parent
+    try:
+        subprocess.Popen([str(proj / ".venv/bin/python"),
+                          str(proj / "lib/google_sync.py"), "sync"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+def _wants_google(args):
+    """--google/-g on the command line, or the google_auto setting."""
+    args, flag = _pop_flag(list(args), "--google", "-g")
+    args, noflag = _pop_flag(args, "--local", "-l")
+    if noflag:
+        return args, False
+    return args, flag or load_state().get("google_auto", False)
+
+def _report_push(push):
+    if not push:
+        return
+    if _google_available():
+        _trigger_sync()
+        print("   ↑ syncing to Google Tasks (appears on your phone shortly)")
+    else:
+        print("   ⚠️  not connected to Google — run 'spiderman google login'."
+              "\n      It'll be pushed automatically once you connect.")
+
+def cmd_remind(args):
+    args, push = _wants_google(args)
+    text, when = _split_text_time(args)
+    tid, due = add_task("reminder", text, when, push=push)
+    print(f"🔔  {APP} — reminder #{tid} for {fmt_due(due)}: {text}")
+    _report_push(push)
+
+def cmd_event(args):
+    """A local calendar-style entry (no external calendar involved)."""
+    args, push = _wants_google(args)
+    text, when = _split_text_time(args)
+    tid, due = add_task("event", text, when, push=push)
+    print(f"📅  {APP} — event #{tid} for {fmt_due(due)}: {text}")
+    _report_push(push)
+
+def cmd_alarm(args):
+    # alarm <time> <text...>   (time first) or <text...> <time>
+    args, push = _wants_google(args)
+    text, when = _split_text_time(args)
+    tid, due = add_task("alarm", text, when, push=push)
+    print(f"⏰  {APP} — alarm #{tid} for {fmt_due(due)}: {text}")
+    _report_push(push)
+
+def _split_text_time(args):
+    """Find which arg is the time; the rest is the text."""
+    if not args:
+        raise SystemExit("Need text and a time. e.g. spiderman remind \"call mom\" 30m")
+    # try last arg as time, then first
+    for idx in (len(args)-1, 0):
+        try:
+            parse_when(args[idx])
+            when = args[idx]
+            text = " ".join(a for i, a in enumerate(args) if i != idx).strip()
+            if text:
+                return text, when
+        except ValueError:
+            continue
+    raise SystemExit("Couldn't find a valid time. Use 30m, 1h, 90s, or 14:30 / 9am.")
+
+def cmd_list(_):
+    tasks = sorted(load_tasks(), key=lambda t: t["due"])
+    if not tasks:
+        print("   No reminders or alarms set.")
+        return
+    print("📋  Your tasks:")
+    for t in tasks:
+        icon = {"alarm": "⏰", "event": "📅"}.get(t["type"], "🔔")
+        print(f"  #{t['id']:<3} {icon} {fmt_due(t['due']):<14} {t['text']}")
+
+def cmd_cancel(args):
+    if not args:
+        raise SystemExit("Usage: spiderman cancel <id>")
+    tid = int(args[0])
+    tasks = load_tasks()
+    gone = next((t for t in tasks if t.get("id") == tid), None)
+    new = [t for t in tasks if t.get("id") != tid]
+    save_tasks(new)
+    if gone is None:
+        print(f"No task #{tid}")
+        return
+    print(f"❌  Cancelled #{tid}")
+    # A task synced from/to Google must be closed there too, otherwise the
+    # next pull resurrects it as a brand-new reminder.
+    if gone.get("gid") and gone.get("glist"):
+        proj = Path(__file__).resolve().parent.parent
+        py = proj / ".venv/bin/python"
+        if py.exists():
+            subprocess.run([str(py), str(proj / "lib/google_sync.py"), "complete",
+                            gone["glist"], gone["gid"]],
+                           capture_output=True, timeout=40)
+            print("   ↑ also completed in Google Tasks")
+
+# ---------------- mute / service ----------------
+def cmd_on(_):
+    s = load_state(); s["muted"] = False; save_state(s)
+    print(f"🔊  {APP} alerts ON")
+
+def cmd_off(_):
+    s = load_state(); s["muted"] = True; save_state(s)
+    print(f"🔇  {APP} muted — alerts off until 'local-asst on'")
+
+def _svc(*a):
+    return subprocess.run(["systemctl", "--user", *a], capture_output=True, text=True)
+
+def cmd_google(args):
+    """Dispatch Google Tasks commands to the venv python (which has the libs)."""
+    # `google auto on|off` is handled locally (it's just a setting)
+    if args and args[0] == "auto":
+        s = load_state()
+        if len(args) > 1 and args[1] in ("on", "off"):
+            s["google_auto"] = (args[1] == "on")
+            save_state(s)
+        state = s.get("google_auto", False)
+        print(f"🔁 auto-push to Google Tasks: {'ON' if state else 'OFF'}")
+        if state:
+            print("   every new reminder/alarm is sent to Google (use --local to skip)")
+        else:
+            print("   use --google on a reminder to push it, or 'google auto on'")
+        return
+
+    proj = Path(__file__).resolve().parent.parent
+    py   = proj / ".venv" / "bin" / "python"
+    mod  = proj / "lib" / "google_sync.py"
+    if not py.exists():
+        print("❌ Project venv missing. Run:  cd ~/spider-asst && ./install.sh")
+        return
+    if not mod.exists():
+        print(f"❌ {mod} not found.")
+        return
+    sub = args[0] if args else "status"
+    raise SystemExit(subprocess.call([str(py), str(mod), sub, *args[1:]]))
+
+
+
+def cmd_character(args):
+    """List or switch the on-screen character."""
+    chars_dir = CONF / "characters"
+    available = sorted(f.stem for f in chars_dir.glob("*.png")) if chars_dir.exists() else []
+    if not available:
+        print("No characters installed. Run:")
+        print("  python3 ~/spider-asst/tools/make_characters.py <folder-of-images>")
+        return
+    cur = load_state().get("character", "spider-man")
+    if not args or args[0] == "list":
+        print("🎭 Characters:")
+        for a in available:
+            print(f"  {'●' if a == cur else ' '} {a.replace('-', ' ').title()}"
+                  f"{'   (current)' if a == cur else ''}")
+        return
+    if args[0] == "set":
+        if len(args) < 2:
+            raise SystemExit("Usage: spiderman character set <name>")
+        want = "-".join(args[1:]).lower().replace(" ", "-")
+        match = next((a for a in available if a == want), None) \
+            or next((a for a in available if a.startswith(want)), None)
+        if not match:
+            raise SystemExit(f"No character '{want}'. Try: {', '.join(available)}")
+        st = load_state(); st["character"] = match; save_state(st)
+        print(f"🎭 Assistant is now {match.replace('-', ' ').title()}")
+        return
+    raise SystemExit("Usage: spiderman character [list|set <name>]")
+
+
+def cmd_app(args):
+    """Open the native GTK desktop application."""
+    proj = Path(__file__).resolve().parent.parent
+    raise SystemExit(subprocess.call([sys.executable, str(proj / "bin" / "spiderman-app"), *args]))
+
+
+def cmd_ui(args):
+    """Open the local React control panel."""
+    proj = Path(__file__).resolve().parent.parent
+    raise SystemExit(subprocess.call([sys.executable, str(proj / "bin" / "spiderman-ui"), *args]))
+
+
+def cmd_calendar(args):
+    """Calendar via secret iCal URL (no OAuth needed)."""
+    proj = Path(__file__).resolve().parent.parent
+    py   = proj / ".venv" / "bin" / "python"
+    mod  = proj / "lib" / "ical_sync.py"
+    if not py.exists() or not mod.exists():
+        print("❌ Project venv/module missing. Run:  cd ~/spider-asst && ./install.sh")
+        return
+    sub = args[0] if args else "show"
+    # Writes live in cal_write.py, which needs PyGObject (gi). That is in the
+    # SYSTEM python, not the venv — so run it with the interpreter we're on.
+    if sub in ("create", "delete", "find", "writable"):
+        mod, py = proj / "lib" / "cal_write.py", Path(sys.executable)
+    raise SystemExit(subprocess.call([str(py), str(mod), sub, *args[1:]]))
+
+
+def cmd_start(_):
+    _svc("start", SERVICE)
+    print(f"▶️   {APP} started")
+
+def cmd_stop(_):
+    _svc("stop", SERVICE)
+    print(f"⏹️   {APP} stopped — bring it back with 'local-asst start'")
+
+def cmd_enable(_):
+    _svc("enable", "--now", SERVICE)
+    print("✅  Autostart enabled — Spider-Man will run on every login (and is running now).")
+
+def cmd_disable(_):
+    _svc("disable", "--now", SERVICE)
+    print("🛑  Autostart disabled and stopped. Re-enable with 'spiderman enable'.")
+
+def cmd_status(_):
+    active = _svc("is-active", SERVICE).stdout.strip()
+    enabled = _svc("is-enabled", SERVICE).stdout.strip()
+    muted = load_state().get("muted")
+    print(f"🤖  {APP} status")
+    print(f"   running : {active}")
+    print(f"   autostart: {enabled}")
+    print(f"   alerts  : {'MUTED' if muted else 'on'}")
+    cap, st = read_battery()
+    if cap is not None:
+        print(f"   battery : {cap}% ({st})")
+    tasks = load_tasks()
+    print(f"   tasks   : {len(tasks)} pending")
+
+# ---------------- battery ----------------
+def read_battery():
+    try:
+        cap = int((BAT / "capacity").read_text().strip())
+        st = (BAT / "status").read_text().strip()
+        return cap, st
+    except Exception:
+        return None, None
+
+# ---------------- GUI (zenity) ----------------
+
+
+def cmd_daemon(_):
+    warned = {"low": False, "crit": False, "full": False}
+    while True:
+        now = time.time()
+        # fire due tasks
+        tasks = load_tasks()
+        changed = False
+        for t in tasks:
+            if not t.get("fired") and t["due"] <= now:
+                kind = t["type"]
+                title = ("⏰ Spider-Man Alarm" if kind == "alarm" else "🕷️ Spider-Man Reminder")
+                alert(title, t["text"], voice=themed_voice(kind, t["text"]),
+                      urgency=("critical" if kind == "alarm" else "normal"))
+                t["fired"] = True
+                changed = True
+        if changed:
+            save_tasks([t for t in tasks if not t.get("fired")])
+        # battery
+        cap, st = read_battery()
+        if cap is not None:
+            charging = st in ("Charging", "Full")
+            if charging:
+                warned["low"] = warned["crit"] = False
+                if cap >= 85 and not warned["full"]:
+                    alert("🕷️ Spider-Man — Battery Care",
+                          f"Charged to {cap}%. Unplug to keep the battery healthy!",
+                          voice=f"Hey web-head, battery's at {cap} percent. Unplug me to protect the battery.")
+                    warned["full"] = True
+            else:
+                warned["full"] = False
+                if cap <= 10 and not warned["crit"]:
+                    alert("🕷️ Spider-Man — CRITICAL Battery",
+                          f"Battery at {cap}%! Plug in NOW or I'm swinging offline.",
+                          voice=f"Danger! Battery critical at {cap} percent. Plug in now!",
+                          urgency="critical")
+                    warned["crit"] = True
+                elif cap <= 20 and not warned["low"]:
+                    alert("🕷️ Spider-Man — Battery Low",
+                          f"Battery at {cap}%. Time to swing to a charger!",
+                          voice=f"Spider-sense tingling. Battery low at {cap} percent. Time to find a charger.")
+                    warned["low"] = True
+        time.sleep(30)
+
+# ---------------- dispatch ----------------
+HELP = """🕷️  Spider-Man — your local assistant
+
+  spiderman remind "call mom" 30m      set a reminder (30m,1h,90s,14:30,9am)
+  spiderman alarm 14:30 "meeting"      set an alarm
+  spiderman list                       list reminders & alarms
+  spiderman cancel <id>                remove one
+  spiderman on | off                   unmute / mute alerts
+  spiderman status                     show state, battery, tasks
+  spiderman enable | disable           autostart on login on/off
+
+  spiderman remind "text" 30m --google also create it in Google Tasks (phone)
+
+  spiderman google login               connect Google Tasks (one-time consent)
+  spiderman google status              show connection + task lists
+  spiderman google sync                sync now (push + pull)
+  spiderman google tasks               show dated tasks in Google
+  spiderman google auto on|off         push every new reminder automatically
+  spiderman google logout              disconnect (deletes local token)
+
+  spiderman calendar set '<iCal URL>'  connect Google Calendar (secret address)
+  spiderman calendar events            upcoming events
+  spiderman calendar show | off        show config / disable
+  spiderman calendar create "Standup" 14:30 [mins]   create a real event
+  spiderman calendar find [text] | delete <uid>      list / remove events
+
+  spiderman character list|set <name>  change the on-screen character
+  spiderman app                        open the desktop application
+  spiderman ui                         open the browser control panel
+"""
+
+CMDS = {"remind": cmd_remind, "alarm": cmd_alarm, "event": cmd_event, "list": cmd_list,
+        "cancel": cmd_cancel, "on": cmd_on, "off": cmd_off,
+        "start": cmd_start, "show": cmd_start, "stop": cmd_stop,
+        "google": cmd_google, "calendar": cmd_calendar, "cal": cmd_calendar, "ui": cmd_ui, "app": cmd_app, "character": cmd_character, "char": cmd_character,
+        "enable": cmd_enable, "disable": cmd_disable, "status": cmd_status,
+        "daemon": cmd_daemon}
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(HELP); return
+    cmd = sys.argv[1]
+    fn = CMDS.get(cmd)
+    if not fn:
+        print(f"Unknown command: {cmd}\n"); print(HELP); return
+    fn(sys.argv[2:])
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+# Python virtual environment (rebuilt by install.sh)
+.venv/
+__pycache__/
+*.pyc
+
+# NEVER commit Google OAuth secrets or tokens
+**/credentials.json
+**/token.json
+**/tokens.json
+*token*.json
+client_secret*.json
+
+# local runtime data
+*.log

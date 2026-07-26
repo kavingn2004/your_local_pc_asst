@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=Local_Asst
+GenericName=Desktop assistant
+Comment=Reminders, calendar, Google Tasks and battery alerts — runs locally
+Exec=__HOME__/.local/bin/spiderman-app
+Icon=__HOME__/.config/spiderman/local-asst.png
+Terminal=false
+Categories=Utility;
+Keywords=reminder;alarm;assistant;calendar;tasks;local;
+StartupNotify=true
+StartupWMClass=com.stacx.LocalAsst
+Actions=StartChar;StopChar;
+
+[Desktop Action StartChar]
+Name=Start character
+Exec=__HOME__/.local/bin/spiderman start
+
+[Desktop Action StopChar]
+Name=Stop character
+Exec=__HOME__/.local/bin/spiderman stop
