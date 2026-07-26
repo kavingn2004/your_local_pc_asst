@@ -1,4 +1,4 @@
-# 🕷️ Spider-Man Assistant
+# 🕷️ your_local_pc_asst
 
 A local desktop assistant for Ubuntu / GNOME. A small Spider-Man character lives
 on your screen, and delivers **reminders, alarms and battery alerts** through a
@@ -29,7 +29,7 @@ Everything runs **locally** and **user-level** — no sudo, no cloud, no account
 ## Install
 
 ```bash
-cd ~/spider-asst
+cd ~/your_local_pc_asst
 ./install.sh
 ```
 
@@ -267,7 +267,7 @@ curl -s -X DELETE localhost:8777/api/tasks/3
 ## Project layout
 
 ```
-spider-asst/
+your_local_pc_asst/
 ├── bin/
 │   ├── spiderman            # CLI: reminders, alarms, control, zenity GUI
 │   └── spiderman-overlay    # GTK3 overlay character + alert loop
